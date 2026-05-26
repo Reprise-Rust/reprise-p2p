@@ -1,0 +1,20 @@
+[package]
+name = "p2p-lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bincode = "2.0.1"
+log = "0.4.29"
+parking_lot = "0.12.5"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+if-addrs = "0.15.0"
+multicast-discovery-socket = "0.1.3"
+rand = "0.10.1"
+reprise-net-util = {git = "https://github.com/Reprise-Rust/reprise-net-util.git"}
+
+ctrlc = "3.5.2"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+simple_logger = "5.2.0"
