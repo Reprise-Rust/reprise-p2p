@@ -1,6 +1,7 @@
-mod state;
+mod tcp_state;
+mod udp;
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 use log::{info, warn};
 use reprise_net_util::tcp_channel::ChannelError;
@@ -9,7 +10,8 @@ use tokio::select;
 use tokio::task::JoinSet;
 use crate::config::ServerConfig;
 use crate::ctrlc_reg::ShutdownListener;
-use crate::server::state::State;
+use crate::server::tcp_state::State;
+use crate::server::udp::run_udp_server;
 use crate::tcp::messages::{NatServerChannel, ToNatClientMsg, ToNatServerMsg};
 use crate::tcp::{CONNECTION_REQUEST_TIMEOUT_MS, SCHEDULE_CON_MS};
 
@@ -19,6 +21,7 @@ pub async fn run_server(cfg: ServerConfig, shutdown: ShutdownListener) {
         set.spawn(run_tcp_server(tcp_port, shutdown.clone()));
     }
     if let Some(udp_port) = cfg.udp_handler_port {
+        set.spawn(run_udp_server(udp_port, shutdown));
     }
 
     set.join_all().await;
