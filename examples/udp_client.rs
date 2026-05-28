@@ -118,7 +118,9 @@ async fn run_chat_session(conn: p2p_lib::udp::client::NewP2pConnection) {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            warn!("Recv error during punch: {:?}", e);
+                        }
                     }
                 }
             }
