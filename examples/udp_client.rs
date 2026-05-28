@@ -101,8 +101,8 @@ async fn run_chat_session(conn: p2p_lib::udp::client::NewP2pConnection) {
 
             tokio::select! {
                 _ = punch_interval.tick() => {
-                    if socket.send(b"punch").await.is_err() {
-                        break;
+                    if let Err(e) = socket.send(b"punch").await {
+                        warn!("Error sending punch message: {:?}", e)
                     }
                 }
                 recv = socket.recv(&mut buf) => {
