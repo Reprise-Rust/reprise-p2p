@@ -1,13 +1,12 @@
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{ed25519, Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
 
 pub type PublicKey = [u8; 32];
 pub type Signature = [u8; 64];
 
 pub const PROTOCOL_VERSION: u8 = 1;
-pub const TO_SERVER_SIGNED_PROTOCOL_VERSION: u8 = 1;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -18,21 +17,20 @@ pub enum ParseError {
         cur: u8,
         remote: u8
     },
-    #[error("Unsupported message protocol version! cur: {cur}, remote: {remote}")]
-    UnsupportedMessageVersion {
-        cur: u8,
-        remote: u8
-    },
-
 
     #[error("Message is too short")]
     TooShort,
     #[error("Invalid timestamp")]
     InvalidTimestamp,
+    #[error("Invalid message content format")]
+    InvalidContentFormat,
+    #[error("Signature verification failed")]
+    InvalidSignature,
 }
 
 enum ToServerRawMessage {
     /// Signed message generated at `timestamp`, valid for 10 seconds after generation timestamp.
+    /// The signature is formed for (timestamp | payload) message
     SignedMessage {
         pubkey: PublicKey,
         timestamp: DateTime<Utc>,
@@ -49,8 +47,13 @@ impl ToServerRawMessage {
 
         let msg_id = bytes[0];
         let remote_ver = bytes[1];
-        let msg_ver = bytes[2];
-        let bytes = &bytes[3..];
+        if remote_ver > PROTOCOL_VERSION {
+            return Err(ParseError::UnsupportedVersion {
+                cur: PROTOCOL_VERSION,
+                remote: remote_ver,
+            })
+        }
+        let bytes = &bytes[2..];
 
         match msg_id {
             1 => {
@@ -89,8 +92,8 @@ impl ToServerRawMessage {
                 signature,
                 pubkey
             } => {
-                res.extend_from_slice(&[1, PROTOCOL_VERSION, TO_SERVER_SIGNED_PROTOCOL_VERSION]);
-                res.extend_from_slice(&timestamp.timestamp().to_le_bytes());
+                res.extend_from_slice(&[1, PROTOCOL_VERSION]);
+                res.extend_from_slice(&timestamp.timestamp_millis().to_le_bytes());
                 res.extend_from_slice(signature);
                 res.extend_from_slice(pubkey);
                 res.extend_from_slice(payload);
@@ -112,8 +115,54 @@ pub enum ToServerSignedMessage {
 impl ToServerSignedMessage {
     /// Input: raw bytes of incoming UDP datagram
     pub fn try_parse(bytes: &[u8]) -> Result<(ToServerSignedMessage, PublicKey, DateTime<Utc>), ParseError> {
+        let raw_msg = ToServerRawMessage::try_parse(&bytes)?;
 
+        match raw_msg {
+            ToServerRawMessage::SignedMessage {
+                pubkey,
+                timestamp,
+                payload,
+                signature
+            } => {
+                let verifying_key = VerifyingKey::from_bytes(&pubkey).map_err(|_| ParseError::InvalidContentFormat)?;
+
+                let mut msg = timestamp.timestamp_millis().to_le_bytes().to_vec();
+                msg.extend_from_slice(&payload);
+
+                verifying_key.verify(&msg, &ed25519::Signature::from_bytes(&signature)).map_err(|_| ParseError::InvalidSignature)?;
+                // After verification, parse message
+
+                if payload.len() == 0 {
+                    return Err(ParseError::TooShort);
+                }
+
+                let msg_id = payload[0];
+                let payload = &payload[1..];
+                let msg = match msg_id {
+                    1 => {
+                        if payload.len() < 1 + 8 + 32 {
+                            return Err(ParseError::InvalidContentFormat);
+                        }
+
+                        let session_id = u32::from_le_bytes(payload[..8].try_into().unwrap());
+                        let payload = &payload[8..];
+
+                        let peer_pubkey = payload[..32].try_into().unwrap();
+                        Self::ConnectionRequest {
+                            session_id,
+                            peer_pubkey,
+                        }
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidMessageId(msg_id));
+                    }
+                };
+
+                Ok((msg, pubkey, timestamp))
+            }
+        }
     }
+
     /// Output: raw bytes of outgoing UDP datagram
     pub fn to_bytes(&self, key: &SigningKey) -> Vec<u8> {
         match self {
@@ -121,7 +170,26 @@ impl ToServerSignedMessage {
                 session_id,
                 peer_pubkey
             } => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&[1]);
+                payload.extend_from_slice(&session_id.to_le_bytes());
+                payload.extend_from_slice(peer_pubkey);
 
+                let timestamp = Utc::now();
+                let timestamp_ms = timestamp.timestamp_millis();
+                let mut msg = timestamp_ms.to_le_bytes().to_vec();
+                msg.extend_from_slice(&payload);
+
+                let signature = key.sign(&msg).to_bytes();
+
+                let res = ToServerRawMessage::SignedMessage {
+                    pubkey: *peer_pubkey,
+                    payload,
+                    signature,
+                    timestamp,
+                };
+
+                res.to_bytes()
             }
         }
     }
@@ -136,5 +204,54 @@ pub enum FromServerMessage {
 }
 
 impl FromServerMessage {
-    
+    pub fn try_parse(bytes: &[u8]) -> Result<FromServerMessage, ParseError> {
+        if bytes.len() == 0 {
+            return Err(ParseError::TooShort);
+        }
+        let msg_id = bytes[0];
+        let bytes = &bytes[1..];
+        let msg = match msg_id {
+            1 => {
+                if bytes.len() < 32 + 4 + 2 + 4 {
+                    return Err(ParseError::TooShort);
+                }
+
+                let pubkey = bytes[..32].try_into().unwrap();
+                let bytes = &bytes[32..];
+
+                let ip_addr = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+                let port = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+                let addr = SocketAddrV4::new(ip_addr, port);
+                let bytes = &bytes[6..];
+
+                let remote_session_id = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+
+                Self::InitiateConnectionRequest {
+                    remote_session_id,
+                    peer_pubkey: pubkey,
+                    peer_address: addr,
+                }
+            }
+            _ => {
+                return Err(ParseError::InvalidMessageId(msg_id));
+            }
+        };
+
+        Ok(msg)
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::InitiateConnectionRequest { peer_pubkey, peer_address, remote_session_id } => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&[1]);
+
+                payload.extend_from_slice(peer_pubkey);
+                payload.extend_from_slice(&peer_address.ip().octets());
+                payload.extend_from_slice(&peer_address.port().to_le_bytes());
+                payload.extend_from_slice(&remote_session_id.to_le_bytes());
+
+                payload
+            }
+        }
+    }
 }

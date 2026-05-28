@@ -2,6 +2,7 @@ pub mod tcp;
 pub mod udp;
 pub mod server;
 pub mod config;
+mod p2p_interface_tracker;
 
 pub mod ctrlc_reg {
     use std::sync::Arc;

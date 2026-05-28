@@ -1,8 +1,9 @@
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use log::Level;
+use log::{info, Level};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
 use p2p_lib::udp::client::UdpClient;
@@ -10,6 +11,8 @@ use p2p_lib::udp::client::UdpClient;
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(Level::Info).unwrap();
+
+    let server_addr = SocketAddrV4::new(Ipv4Addr::new(155, 212, 168, 136), 47002);
 
     let mut rng = UnwrapErr(rngs::SysRng::default());
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
@@ -38,13 +41,13 @@ async fn main() {
         }
     };
 
-    let mut client = UdpClient::new(signing_key);
+    let mut client = UdpClient::new(signing_key, server_addr).await;
     client.add_trusted_remote(peer_key.try_into().unwrap());
     println!("Remote peer added, waiting for connection...");
 
     loop {
-        client.poll_accept();
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some(new_connection) = client.poll_accept(Duration::from_millis(100)).await {
+            info!("Got new connection request from P2P server: {}", new_connection.remote_addr);
+        }
     }
 }
