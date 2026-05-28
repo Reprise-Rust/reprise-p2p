@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
+use chrono::Utc;
 use log::{error, info, warn};
 use tokio::net::UdpSocket;
 use tokio::select;
@@ -8,14 +9,12 @@ use crate::ctrlc_reg::ShutdownListener;
 use crate::udp::messages::{FromServerMessage, PublicKey, ToServerSignedMessage};
 
 const REQUEST_TIMEOUT_S: u64 = 10;
+const SIGNED_MSG_VALID_S: i64 = 10;
 
 struct PendingRequest {
     requester_pubkey: PublicKey,
     requester_addr: SocketAddr,
     requester_session_id: u32,
-    /// The session IDs that were used when we last notified this pair.
-    last_notified_requester_session: Option<u32>,
-    last_notified_target_session: Option<u32>,
     tm: Instant,
 }
 
@@ -55,7 +54,14 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                             Err(e) => {
                                 error!("[Reprise:UDP] Error parsing client message: {}", e);
                             }
-                            Ok((parsed_msg, sender_pubkey, _tm)) => {
+                            Ok((parsed_msg, sender_pubkey, tm)) => {
+                                // Reject messages with timestamps too far from now (replay protection).
+                                let now = Utc::now();
+                                if (now - tm).num_seconds().abs() > SIGNED_MSG_VALID_S {
+                                    warn!("[Reprise:UDP] Rejected message with stale timestamp (diff: {}s)", (now - tm).num_seconds().abs());
+                                    continue;
+                                }
+
                                 match parsed_msg {
                                     ToServerSignedMessage::ConnectionRequest {
                                         peer_pubkey,
@@ -66,17 +72,9 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                         let forward_key = (sender_pubkey, peer_pubkey);
                                         let reverse_key = (peer_pubkey, sender_pubkey);
 
-                                        // Snapshot the reverse entry to check if we should notify.
-                                        let should_notify = state.requests.get(&reverse_key).map_or(false, |pending| {
-                                            pending.last_notified_requester_session != Some(pending.requester_session_id)
-                                                || pending.last_notified_target_session != Some(session_id)
-                                        });
-
-                                        if should_notify {
-                                            // Remove the reverse entry and extract data we need.
-                                            let pending = state.requests.remove(&reverse_key).unwrap();
-
-                                            info!("[Reprise:UDP] Matched connection request between peers: connecting {} and {}", addr, pending.requester_addr);
+                                        if let Some(pending) = state.requests.remove(&reverse_key) {
+                                            // Matching reverse request found — notify both peers and remove both entries.
+                                            info!("[Reprise:UDP] Matched connection request between peers");
 
                                             let to_original = FromServerMessage::InitiateConnectionRequest {
                                                 peer_pubkey: sender_pubkey,
@@ -111,42 +109,14 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                             if let Err(e) = socket.send_to(&to_new_bytes, addr).await {
                                                 warn!("[Reprise:UDP] Failed to send to new requester {}: {}", addr, e);
                                             }
-
-                                            // Re-insert reverse entry with updated notification tracking and new requester info.
-                                            state.requests.insert(reverse_key, PendingRequest {
-                                                requester_pubkey: pending.requester_pubkey,
-                                                requester_addr: pending.requester_addr,
-                                                requester_session_id: pending.requester_session_id,
-                                                last_notified_requester_session: Some(pending.requester_session_id),
-                                                last_notified_target_session: Some(session_id),
-                                                tm: Instant::now(),
-                                            });
-
-                                            // Insert/update forward entry.
+                                        } else {
+                                            // No match yet — store this request.
                                             state.requests.insert(forward_key, PendingRequest {
                                                 requester_pubkey: sender_pubkey,
                                                 requester_addr: addr,
                                                 requester_session_id: session_id,
-                                                last_notified_requester_session: Some(session_id),
-                                                last_notified_target_session: Some(pending.requester_session_id),
                                                 tm: Instant::now(),
                                             });
-                                        } else {
-                                            // No match or already notified — just store/update.
-                                            state.requests.entry(forward_key)
-                                                .and_modify(|r| {
-                                                    r.requester_addr = addr;
-                                                    r.requester_session_id = session_id;
-                                                    r.tm = Instant::now();
-                                                })
-                                                .or_insert(PendingRequest {
-                                                    requester_pubkey: sender_pubkey,
-                                                    requester_addr: addr,
-                                                    requester_session_id: session_id,
-                                                    last_notified_requester_session: None,
-                                                    last_notified_target_session: None,
-                                                    tm: Instant::now(),
-                                                });
                                         }
                                     }
                                 }

@@ -10,9 +10,17 @@ use crate::udp::messages;
 use crate::udp::messages::{FromServerMessage, PublicKey};
 use crate::udp::reusable_udp_socket::ReusableUdpSocket;
 
+struct PeerState {
+    /// Whether we're actively trying to connect to this peer.
+    active: bool,
+    /// The last `remote_session_id` we accepted from the server for this peer.
+    /// Used to ignore duplicate notifications.
+    last_accepted_session_id: Option<u32>,
+}
+
 pub struct UdpClient {
     p2p_server_addr: SocketAddrV4,
-    trusted_remotes: BTreeMap<PublicKey, bool>,
+    trusted_remotes: BTreeMap<PublicKey, PeerState>,
     last_request_tm: Option<Instant>,
     key: SigningKey,
     session_id: u32,
@@ -42,7 +50,10 @@ impl UdpClient {
     }
 
     pub fn add_trusted_remote(&mut self, key: PublicKey) {
-        self.trusted_remotes.insert(key, true);
+        self.trusted_remotes.insert(key, PeerState {
+            active: true,
+            last_accepted_session_id: None,
+        });
     }
 
     pub fn remove_trusted_remote(&mut self, key: PublicKey) {
@@ -53,8 +64,8 @@ impl UdpClient {
         self.session_id = random();
         self.p2p_server_socket.take();
         let socket = self.parent_socket.new_connection(self.p2p_server_addr).await;
-        for (pubkey, active) in &self.trusted_remotes {
-            if !active {
+        for (pubkey, state) in &self.trusted_remotes {
+            if !state.active {
                 continue;
             }
             let payload = messages::ToServerSignedMessage::ConnectionRequest {
@@ -93,15 +104,21 @@ impl UdpClient {
                             FromServerMessage::InitiateConnectionRequest {
                                 peer_address,
                                 peer_pubkey,
-                                remote_session_id: _
+                                remote_session_id
                             } => {
-                                if let Some(active) = self.trusted_remotes.get_mut(&peer_pubkey) {
-                                    if !*active {
-                                        warn!("Got client connection request, but we are already connecting to this client");
+                                if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
+                                    if !state.active {
+                                        warn!("Got duplicate connection notification, ignoring");
                                         return None;
                                     }
 
-                                    *active = false;
+                                    if state.last_accepted_session_id == Some(remote_session_id) {
+                                        // Duplicate notification for the same session — ignore.
+                                        return None;
+                                    }
+
+                                    state.active = false;
+                                    state.last_accepted_session_id = Some(remote_session_id);
                                     let socket = self.parent_socket.new_connection(peer_address).await;
                                     return Some(NewP2pConnection {
                                         pubkey: peer_pubkey,
