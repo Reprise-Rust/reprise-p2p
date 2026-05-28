@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::{SocketAddrV4};
+use std::collections::BTreeMap;
+use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use log::warn;
@@ -50,9 +50,13 @@ impl UdpClient {
     }
 
     async fn place_connection_requests(&mut self) {
-        self.p2p_server_socket.take(); // remove previous connected socket
-        let socket = self.parent_socket.new_connection(self.p2p_server_addr).await; // create a new connected socket
-        for (pubkey, _) in &self.trusted_remotes {
+        self.session_id = random();
+        self.p2p_server_socket.take();
+        let socket = self.parent_socket.new_connection(self.p2p_server_addr).await;
+        for (pubkey, active) in &self.trusted_remotes {
+            if !active {
+                continue;
+            }
             let payload = messages::ToServerSignedMessage::ConnectionRequest {
                 peer_pubkey: *pubkey,
                 session_id: self.session_id,
@@ -89,17 +93,15 @@ impl UdpClient {
                             FromServerMessage::InitiateConnectionRequest {
                                 peer_address,
                                 peer_pubkey,
-                                remote_session_id
+                                remote_session_id: _
                             } => {
-                                if let Some(e) = self.trusted_remotes.get_mut(&peer_pubkey) {
-                                    if !*e {
-                                        // we are not connecting to this client currently
+                                if let Some(active) = self.trusted_remotes.get_mut(&peer_pubkey) {
+                                    if !*active {
                                         warn!("Got client connection request, but we are already connecting to this client");
                                         return None;
                                     }
 
-                                    *e = false;
-                                    // we can initiate p2p connection
+                                    *active = false;
                                     let socket = self.parent_socket.new_connection(peer_address).await;
                                     return Some(NewP2pConnection {
                                         pubkey: peer_pubkey,
