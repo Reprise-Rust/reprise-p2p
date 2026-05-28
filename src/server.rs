@@ -3,7 +3,7 @@ mod udp;
 
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
-use log::{info, warn};
+use log::{error, info, warn};
 use reprise_net_util::tcp_channel::ChannelError;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
@@ -24,7 +24,11 @@ pub async fn run_server(cfg: ServerConfig, shutdown: ShutdownListener) {
         set.spawn(run_udp_server(udp_port, shutdown));
     }
 
-    set.join_all().await;
+    while let Some(res) = set.join_next().await {
+        if let Err(e) = res {
+            error!("[Reprise:UDP] server exited with error: {}", e);
+        }
+    }
 }
 
 async fn run_tcp_server(port: u16, mut shutdown: ShutdownListener) {
