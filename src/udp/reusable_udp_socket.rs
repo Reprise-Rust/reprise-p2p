@@ -29,7 +29,7 @@ impl ReusableUdpSocket {
         Self::new_inner(None)
     }
 
-    pub fn new_connection(&mut self, remote: SocketAddrV4) -> UdpSocket {
+    pub async fn new_connection(&mut self, remote: SocketAddrV4) -> UdpSocket {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
         socket.set_reuse_address(true).unwrap();
         #[cfg(not(windows))]
@@ -61,6 +61,7 @@ impl ReusableUdpSocket {
         std_socket.set_nonblocking(true).unwrap();
         
         let res = UdpSocket::from_std(std_socket).unwrap();
+        res.connect(remote).await.unwrap();
         res
     }
 

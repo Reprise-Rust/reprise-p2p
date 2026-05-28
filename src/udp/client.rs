@@ -51,7 +51,7 @@ impl UdpClient {
 
     async fn place_connection_requests(&mut self) {
         self.p2p_server_socket.take(); // remove previous connected socket
-        let socket = self.parent_socket.new_connection(self.p2p_server_addr); // create a new connected socket
+        let socket = self.parent_socket.new_connection(self.p2p_server_addr).await; // create a new connected socket
         for (pubkey, _) in &self.trusted_remotes {
             let payload = messages::ToServerSignedMessage::ConnectionRequest {
                 peer_pubkey: *pubkey,
@@ -91,9 +91,16 @@ impl UdpClient {
                                 peer_pubkey,
                                 remote_session_id
                             } => {
-                                if self.trusted_remotes.contains_key(&peer_pubkey) {
+                                if let Some(e) = self.trusted_remotes.get_mut(&peer_pubkey) {
+                                    if !*e {
+                                        // we are not connecting to this client currently
+                                        warn!("Got client connection request, but we are already connecting to this client");
+                                        return None;
+                                    }
+
+                                    *e = false;
                                     // we can initiate p2p connection
-                                    let socket = self.parent_socket.new_connection(peer_address);
+                                    let socket = self.parent_socket.new_connection(peer_address).await;
                                     return Some(NewP2pConnection {
                                         pubkey: peer_pubkey,
                                         remote_addr: peer_address,

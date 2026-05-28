@@ -140,12 +140,12 @@ impl ToServerSignedMessage {
                 let payload = &payload[1..];
                 let msg = match msg_id {
                     1 => {
-                        if payload.len() < 1 + 8 + 32 {
+                        if payload.len() < 4 + 32 {
                             return Err(ParseError::InvalidContentFormat);
                         }
 
-                        let session_id = u32::from_le_bytes(payload[..8].try_into().unwrap());
-                        let payload = &payload[8..];
+                        let session_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                        let payload = &payload[4..];
 
                         let peer_pubkey = payload[..32].try_into().unwrap();
                         Self::ConnectionRequest {
@@ -182,8 +182,9 @@ impl ToServerSignedMessage {
 
                 let signature = key.sign(&msg).to_bytes();
 
+                let our_pubkey = key.verifying_key().to_bytes();
                 let res = ToServerRawMessage::SignedMessage {
-                    pubkey: *peer_pubkey,
+                    pubkey: our_pubkey,
                     payload,
                     signature,
                     timestamp,
