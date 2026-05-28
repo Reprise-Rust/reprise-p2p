@@ -16,6 +16,7 @@ reprise-net-util = {git = "https://github.com/Reprise-Rust/reprise-net-util.git"
 ctrlc = "3.5.2"
 thiserror = "2.0.18"
 ed25519-dalek = { version = "3.0.0-pre.7", features = ["rand_core"]}
+chrono = "0.4.44"
 
 [dev-dependencies]
 simple_logger = "5.2.0"
