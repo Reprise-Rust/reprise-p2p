@@ -76,7 +76,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                             // Remove the reverse entry and extract data we need.
                                             let pending = state.requests.remove(&reverse_key).unwrap();
 
-                                            info!("[Reprise:UDP] Matched connection request between peers");
+                                            info!("[Reprise:UDP] Matched connection request between peers: connecting {} and {}", addr, pending.requester_addr);
 
                                             let to_original = FromServerMessage::InitiateConnectionRequest {
                                                 peer_pubkey: sender_pubkey,
