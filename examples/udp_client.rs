@@ -3,11 +3,10 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use log::{info, warn, Level};
+use log::{error, info, Level};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
 use p2p_lib::udp::client::UdpClient;
-use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
@@ -47,27 +46,8 @@ async fn main() {
     client.add_trusted_remote(peer_key);
     println!("Remote peer added, waiting for connection...");
 
-    loop {
-        if let Some(new_connection) = client.poll_accept(Duration::from_millis(100)).await {
-            info!("Got new connection request from P2P server: {}", new_connection.remote_addr);
-            run_chat_session(new_connection).await;
-            client.add_trusted_remote(peer_key);
-            println!("Disconnected. Waiting for new connection...");
-        }
-    }
-}
-
-enum NetEvent {
-    ChatMessage(String),
-    Disconnected,
-}
-
-async fn run_chat_session(conn: p2p_lib::udp::client::NewP2pConnection) {
-    let (net_tx, mut net_rx) = mpsc::channel::<NetEvent>(32);
-    let (send_tx, send_rx) = mpsc::channel::<String>(32);
-    let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(32);
-
-    // Spawn blocking stdin reader.
+    // Long-running stdin reader — lives for the entire program.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
     std::thread::spawn(move || {
         loop {
             let mut line = String::new();
@@ -78,145 +58,31 @@ async fn run_chat_session(conn: p2p_lib::udp::client::NewP2pConnection) {
                 break;
             }
         }
+        error!("stdin task finished!")
     });
 
-    // Spawn network task.
-    let net_task = tokio::spawn(async move {
-        let socket = conn.socket;
-        let peer = conn.remote_addr;
-        let mut send_rx = send_rx;
-
-        // --- Punch phase ---
-        // --- Phase 1: Punch exchange (up to 500ms) ---
-        // Both sides must receive a "punch ack" from the other before the hole is truly open.
-        // This means each side must: (1) receive a "punch" and send "punch ack" back,
-        // and (2) receive a "punch ack" (meaning the other side got our "punch").
-        info!("Starting hole punch to {}...", peer);
-        let punch_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        let mut punch_interval = tokio::time::interval(Duration::from_millis(20));
-        let mut got_punch = false;
-        let mut got_punch_ack = false;
-
-        let mut buf = vec![0u8; 2000];
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= punch_deadline {
-                break;
-            }
-            // Exit early once both sides have acknowledged each other.
-            if got_punch && got_punch_ack {
-                break;
-            }
-
-            tokio::select! {
-                _ = punch_interval.tick() => {
-                    if let Err(e) = socket.send(b"punch").await {
-                        warn!("Error sending punch message: {:?}", e)
-                    }
-                }
-                recv = socket.recv(&mut buf) => {
-                    match recv {
-                        Ok(sz) => {
-                            let msg = &buf[..sz];
-                            if msg == b"punch" {
-                                info!("Received punch from {}, sending ack", peer);
-                                let _ = socket.send(b"punch ack").await;
-                                got_punch = true;
-                            } else if msg == b"punch ack" {
-                                info!("Received punch ack from {}", peer);
-                                got_punch_ack = true;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Recv error during punch: {:?}", e);
-                        }
-                    }
-                }
-            }
+    loop {
+        if let Some(conn) = client.poll_accept(Duration::from_millis(100)).await {
+            info!("Hole-punched connection established with: {}", conn.remote_addr);
+            run_chat_session(conn, &mut stdin_rx).await;
+            client.add_trusted_remote(peer_key);
+            println!("Disconnected. Waiting for new connection...");
         }
+    }
+}
 
-        if !got_punch || !got_punch_ack {
-            warn!("Hole punching failed (timeout) — got_punch={}, got_punch_ack={}", got_punch, got_punch_ack);
-            let _ = net_tx.send(NetEvent::Disconnected).await;
-            return;
-        }
+async fn run_chat_session(
+    conn: p2p_lib::udp::client::NewP2pConnection,
+    stdin_rx: &mut tokio::sync::mpsc::Receiver<String>,
+) {
+    let socket = conn.socket;
+    let peer = conn.remote_addr;
 
-        // --- Phase 2: Drain remaining punch/ack packets (200ms) ---
-        info!("Punch exchange done, draining socket...");
-        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= drain_deadline {
-                break;
-            }
-            match tokio::time::timeout_at(drain_deadline, socket.recv(&mut buf)).await {
-                Ok(Ok(sz)) => {
-                    let msg = &buf[..sz];
-                    if msg != b"punch" && msg != b"punch ack" {
-                        warn!("Unexpected packet during drain: {:?}", msg);
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("Recv error during drain: {:?}", e);
-                }
-                Err(_) => {
-                    break;
-                }
-            }
-        }
+    println!("=== Chat with {:?} started! Type /exit to quit. ===", peer);
 
-        // --- Phase 3: Settle (200ms) ---
-        info!("Drain done, settling...");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        info!("Hole punched with {}!", peer);
-
-        let _ = net_tx.send(NetEvent::ChatMessage(format!("=== Chat with {:?} started! Type /exit to quit. ===", peer))).await;
-
-        loop {
-            tokio::select! {
-                recv = socket.recv(&mut buf) => {
-                    match recv {
-                        Ok(sz) => {
-                            let msg = String::from_utf8_lossy(&buf[..sz]).to_string();
-                            if net_tx.send(NetEvent::ChatMessage(format!("<peer> {}", msg))).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => {
-                            let _ = net_tx.send(NetEvent::Disconnected).await;
-                            break;
-                        }
-                    }
-                }
-                msg = send_rx.recv() => {
-                    match msg {
-                        Some(msg) => {
-                            if socket.send(msg.as_bytes()).await.is_err() {
-                                let _ = net_tx.send(NetEvent::Disconnected).await;
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-    });
-
-    // --- Main task loop: drives terminal I/O ---
+    let mut buf = vec![0u8; 2000];
     loop {
         tokio::select! {
-            event = net_rx.recv() => {
-                match event {
-                    Some(NetEvent::ChatMessage(msg)) => {
-                        println!("{}", msg);
-                    }
-                    Some(NetEvent::Disconnected) | None => {
-                        break;
-                    }
-                }
-            }
             line = stdin_rx.recv() => {
                 match line {
                     Some(msg) if msg == "/exit" => {
@@ -224,16 +90,30 @@ async fn run_chat_session(conn: p2p_lib::udp::client::NewP2pConnection) {
                         break;
                     }
                     Some(msg) => {
-                        if send_tx.send(msg).await.is_err() {
+                        if socket.send(msg.as_bytes()).await.is_err() {
                             break;
                         }
                     }
-                    None => break,
+                    None => {
+                        error!("stdin channel closed, exiting.");
+                        break;
+                    }
+                }
+            }
+            recv = socket.recv(&mut buf) => {
+                match recv {
+                    Ok(sz) => {
+                        let msg = String::from_utf8_lossy(&buf[..sz]);
+                        println!("<peer> {}", msg);
+                    }
+                    Err(_) => {
+                        println!("Connection lost.");
+                        break;
+                    }
                 }
             }
         }
     }
 
-    net_task.abort();
     info!("Chat session ended.");
 }

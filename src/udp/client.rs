@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
-use log::warn;
+use log::{info, warn};
 use rand::random;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -30,6 +30,7 @@ pub struct UdpClient {
 
 const REQUEST_PLACEMENT_INTERVAL: u64 = 2;
 
+/// A fully hole-punched, ready-to-use P2P connection.
 pub struct NewP2pConnection {
     pub pubkey: PublicKey,
     pub remote_addr: SocketAddrV4,
@@ -60,7 +61,6 @@ impl UdpClient {
         self.trusted_remotes.remove(&key);
     }
 
-    /// Returns None if failed to start a new connection
     async fn place_connection_requests(&mut self) -> Option<()> {
         self.session_id = random();
         self.p2p_server_socket.take();
@@ -84,8 +84,93 @@ impl UdpClient {
         Some(())
     }
 
-    /// Block for `dur`, immediately returning if new connection request appears.
-    /// Highly recommended to call this function in separate task in a loop
+    /// Perform the full hole punch handshake on the given socket.
+    /// Returns `true` if the hole was successfully punched.
+    async fn hole_punch(&self, socket: &UdpSocket, peer: SocketAddrV4) -> bool {
+        // Phase 1: Punch exchange (up to 500ms)
+        info!("Starting hole punch to {}...", peer);
+        let punch_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let mut punch_interval = tokio::time::interval(Duration::from_millis(20));
+        let mut got_punch = false;
+        let mut got_punch_ack = false;
+
+        let mut buf = vec![0u8; 2000];
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= punch_deadline {
+                break;
+            }
+            if got_punch && got_punch_ack {
+                break;
+            }
+
+            tokio::select! {
+                _ = punch_interval.tick() => {
+                    if let Err(e) = socket.send(b"punch").await {
+                        warn!("Error sending punch message: {:?}", e)
+                    }
+                }
+                recv = socket.recv(&mut buf) => {
+                    match recv {
+                        Ok(sz) => {
+                            let msg = &buf[..sz];
+                            if msg == b"punch" {
+                                info!("Received punch from {}, sending ack", peer);
+                                let _ = socket.send(b"punch ack").await;
+                                got_punch = true;
+                            } else if msg == b"punch ack" {
+                                info!("Received punch ack from {}", peer);
+                                got_punch_ack = true;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Recv error during punch: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !got_punch || !got_punch_ack {
+            warn!("Hole punching failed (timeout) — got_punch={}, got_punch_ack={}", got_punch, got_punch_ack);
+            return false;
+        }
+
+        // Phase 2: Drain remaining punch/ack packets (200ms)
+        info!("Punch exchange done, draining socket...");
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= drain_deadline {
+                break;
+            }
+            match tokio::time::timeout_at(drain_deadline, socket.recv(&mut buf)).await {
+                Ok(Ok(sz)) => {
+                    let msg = &buf[..sz];
+                    if msg != b"punch" && msg != b"punch ack" {
+                        warn!("Unexpected packet during drain: {:?}", msg);
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("Recv error during drain: {:?}", e);
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+
+        // Phase 3: Settle (200ms)
+        info!("Drain done, settling...");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        info!("Hole punched with {}!", peer);
+        true
+    }
+
+    /// Block for `dur`, immediately returning if a new hole-punched connection is ready.
+    /// The returned connection has already completed the full hole punch handshake
+    /// and is ready for immediate send/recv use.
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<NewP2pConnection> {
         if self.trusted_remotes.is_empty() {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -118,17 +203,23 @@ impl UdpClient {
                                     }
 
                                     if state.last_accepted_session_id == Some(remote_session_id) {
-                                        // Duplicate notification for the same session — ignore.
                                         return None;
                                     }
 
                                     state.active = false;
                                     state.last_accepted_session_id = Some(remote_session_id);
+
                                     let socket = self.parent_socket.new_connection(peer_address).await;
                                     let Some(socket) = socket else {
                                         warn!("Failed to connect udp socket to remote peer");
                                         return None
                                     };
+
+                                    if !self.hole_punch(&socket, peer_address).await {
+                                        warn!("Hole punch failed for peer {}", peer_address);
+                                        return None;
+                                    }
+
                                     return Some(NewP2pConnection {
                                         pubkey: peer_pubkey,
                                         remote_addr: peer_address,
