@@ -60,10 +60,11 @@ impl UdpClient {
         self.trusted_remotes.remove(&key);
     }
 
-    async fn place_connection_requests(&mut self) {
+    /// Returns None if failed to start a new connection
+    async fn place_connection_requests(&mut self) -> Option<()> {
         self.session_id = random();
         self.p2p_server_socket.take();
-        let socket = self.parent_socket.new_connection(self.p2p_server_addr).await;
+        let socket = self.parent_socket.new_connection(self.p2p_server_addr).await?;
         for (pubkey, state) in &self.trusted_remotes {
             if !state.active {
                 continue;
@@ -79,6 +80,8 @@ impl UdpClient {
         }
         self.p2p_server_socket = Some(socket);
         self.last_request_tm = Some(Instant::now());
+
+        Some(())
     }
 
     /// Block for `dur`, immediately returning if new connection request appears.
@@ -90,7 +93,9 @@ impl UdpClient {
         }
 
         if self.last_request_tm.is_none_or(|i| i.elapsed().as_secs() > REQUEST_PLACEMENT_INTERVAL) {
-            self.place_connection_requests().await;
+            if self.place_connection_requests().await.is_none() {
+                warn!("Failed to connect udp socket to p2p server!")
+            }
         }
 
         let mut buf = vec![0; 2000];
@@ -120,6 +125,10 @@ impl UdpClient {
                                     state.active = false;
                                     state.last_accepted_session_id = Some(remote_session_id);
                                     let socket = self.parent_socket.new_connection(peer_address).await;
+                                    let Some(socket) = socket else {
+                                        warn!("Failed to connect udp socket to remote peer");
+                                        return None
+                                    };
                                     return Some(NewP2pConnection {
                                         pubkey: peer_pubkey,
                                         remote_addr: peer_address,

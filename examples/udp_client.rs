@@ -87,15 +87,24 @@ async fn run_chat_session(conn: p2p_lib::udp::client::NewP2pConnection) {
         let mut send_rx = send_rx;
 
         // --- Punch phase ---
+        // --- Phase 1: Punch exchange (up to 500ms) ---
+        // Both sides must receive a "punch ack" from the other before the hole is truly open.
+        // This means each side must: (1) receive a "punch" and send "punch ack" back,
+        // and (2) receive a "punch ack" (meaning the other side got our "punch").
         info!("Starting hole punch to {}...", peer);
         let punch_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut punch_interval = tokio::time::interval(Duration::from_millis(20));
-        let mut hole_punched = false;
+        let mut got_punch = false;
+        let mut got_punch_ack = false;
 
         let mut buf = vec![0u8; 2000];
         loop {
             let now = tokio::time::Instant::now();
             if now >= punch_deadline {
+                break;
+            }
+            // Exit early once both sides have acknowledged each other.
+            if got_punch && got_punch_ack {
                 break;
             }
 
@@ -112,10 +121,10 @@ async fn run_chat_session(conn: p2p_lib::udp::client::NewP2pConnection) {
                             if msg == b"punch" {
                                 info!("Received punch from {}, sending ack", peer);
                                 let _ = socket.send(b"punch ack").await;
+                                got_punch = true;
                             } else if msg == b"punch ack" {
-                                info!("Received punch ack from {} - hole punched!", peer);
-                                hole_punched = true;
-                                break;
+                                info!("Received punch ack from {}", peer);
+                                got_punch_ack = true;
                             }
                         }
                         Err(e) => {
@@ -126,11 +135,41 @@ async fn run_chat_session(conn: p2p_lib::udp::client::NewP2pConnection) {
             }
         }
 
-        if !hole_punched {
-            warn!("Hole punching failed (timeout)");
+        if !got_punch || !got_punch_ack {
+            warn!("Hole punching failed (timeout) — got_punch={}, got_punch_ack={}", got_punch, got_punch_ack);
             let _ = net_tx.send(NetEvent::Disconnected).await;
             return;
         }
+
+        // --- Phase 2: Drain remaining punch/ack packets (200ms) ---
+        info!("Punch exchange done, draining socket...");
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= drain_deadline {
+                break;
+            }
+            match tokio::time::timeout_at(drain_deadline, socket.recv(&mut buf)).await {
+                Ok(Ok(sz)) => {
+                    let msg = &buf[..sz];
+                    if msg != b"punch" && msg != b"punch ack" {
+                        warn!("Unexpected packet during drain: {:?}", msg);
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("Recv error during drain: {:?}", e);
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+
+        // --- Phase 3: Settle (200ms) ---
+        info!("Drain done, settling...");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        info!("Hole punched with {}!", peer);
 
         let _ = net_tx.send(NetEvent::ChatMessage(format!("=== Chat with {:?} started! Type /exit to quit. ===", peer))).await;
 
