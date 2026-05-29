@@ -86,6 +86,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                                     }
                                                 },
                                                 remote_session_id: session_id,
+                                                is_listener: false,
                                             };
 
                                             let to_new = FromServerMessage::InitiateConnectionRequest {
@@ -98,6 +99,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                                     }
                                                 },
                                                 remote_session_id: pending.requester_session_id,
+                                                is_listener: true
                                             };
 
                                             let to_original_bytes = to_original.to_bytes();

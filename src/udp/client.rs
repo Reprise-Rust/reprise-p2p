@@ -35,6 +35,7 @@ pub struct NewP2pConnection {
     pub pubkey: PublicKey,
     pub remote_addr: SocketAddrV4,
     pub socket: UdpSocket,
+    pub is_listener: bool,
 }
 
 impl UdpClient {
@@ -194,7 +195,8 @@ impl UdpClient {
                             FromServerMessage::InitiateConnectionRequest {
                                 peer_address,
                                 peer_pubkey,
-                                remote_session_id
+                                remote_session_id,
+                                is_listener,
                             } => {
                                 if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
                                     if !state.active {
@@ -223,7 +225,8 @@ impl UdpClient {
                                     return Some(NewP2pConnection {
                                         pubkey: peer_pubkey,
                                         remote_addr: peer_address,
-                                        socket
+                                        socket,
+                                        is_listener,
                                     })
                                 }
                                 else {

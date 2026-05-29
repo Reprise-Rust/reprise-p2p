@@ -201,6 +201,7 @@ pub enum FromServerMessage {
         peer_pubkey: PublicKey,
         peer_address: SocketAddrV4,
         remote_session_id: u32,
+        is_listener: bool,
     }
 }
 
@@ -213,7 +214,7 @@ impl FromServerMessage {
         let bytes = &bytes[1..];
         let msg = match msg_id {
             1 => {
-                if bytes.len() < 32 + 4 + 2 + 4 {
+                if bytes.len() < 32 + 4 + 2 + 4 + 1 {
                     return Err(ParseError::TooShort);
                 }
 
@@ -226,11 +227,15 @@ impl FromServerMessage {
                 let bytes = &bytes[6..];
 
                 let remote_session_id = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                let bytes = &bytes[4..];
+
+                let is_listener = bytes[0] == 1;
 
                 Self::InitiateConnectionRequest {
                     remote_session_id,
                     peer_pubkey: pubkey,
                     peer_address: addr,
+                    is_listener,
                 }
             }
             _ => {
@@ -242,7 +247,7 @@ impl FromServerMessage {
     }
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Self::InitiateConnectionRequest { peer_pubkey, peer_address, remote_session_id } => {
+            Self::InitiateConnectionRequest { peer_pubkey, peer_address, remote_session_id, is_listener } => {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&[1]);
 
@@ -250,6 +255,7 @@ impl FromServerMessage {
                 payload.extend_from_slice(&peer_address.ip().octets());
                 payload.extend_from_slice(&peer_address.port().to_le_bytes());
                 payload.extend_from_slice(&remote_session_id.to_le_bytes());
+                payload.push(*is_listener as u8);
 
                 payload
             }
