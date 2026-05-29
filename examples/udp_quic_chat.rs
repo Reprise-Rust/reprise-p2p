@@ -1,17 +1,34 @@
+use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use log::{error, info, Level};
-use quinn::{Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
+use quinn::{rustls, ClientConfig, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
+use rcgen::{CertificateParams, PKCS_ED25519};
 use p2p_lib::udp::client::UdpClient;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
+use crate::quic::PeerPublicKeyVerifier;
 
 #[path = "common/quic.rs"]
 mod quic;
+
+fn quinn_cert_from_key(signing_key: &SigningKey) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let pkcs8_bytes = signing_key.to_pkcs8_der().unwrap();
+    let priv_key_der = PrivateKeyDer::Pkcs8(pkcs8_bytes.as_bytes().into());
+
+    let keypair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8_bytes.as_bytes().into(), &PKCS_ED25519).unwrap();
+    let params = CertificateParams::new(vec!["reprise-p2p".to_string()]).unwrap();
+    let cert = params.self_signed(&keypair).unwrap();
+
+    (cert.der().clone(), priv_key_der.clone_key())
+}
 
 #[tokio::main]
 async fn main() {
@@ -21,8 +38,6 @@ async fn main() {
 
     let mut rng = UnwrapErr(rngs::SysRng::default());
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
-    let pkcs8_bytes = signing_key.to_pkcs8_der().unwrap();
-    let pkcs8_bytes = pkcs8_bytes.as_bytes().to_vec();
 
     let v_key = signing_key.verifying_key();
     let pubkey_enc = STANDARD_NO_PAD.encode(v_key.as_bytes());
@@ -49,7 +64,7 @@ async fn main() {
     };
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
-    let mut client = UdpClient::new(signing_key, server_addr).await;
+    let mut client = UdpClient::new(signing_key.clone(), server_addr).await;
     client.add_trusted_remote(peer_key);
 
     // create quinn endpoint
@@ -72,16 +87,43 @@ async fn main() {
 
     loop {
         if let Some(conn) = client.poll_accept(Duration::from_millis(100)).await {
+            info!("Hole-punched connection established with: {}", conn.remote_addr);
+
             let endpoint_config = EndpointConfig::default();
-            let server_config = ServerConfig::with_single_cert(vec![])
-            let ep = if conn.is_listener {
-                Endpoint::new(endpoint_config, server_config, client_config, Arc::new(TokioRuntime))
+            let (cert, key) = quinn_cert_from_key(&signing_key);
+
+            let expected_pubkey = VerifyingKey::from_bytes(&conn.pubkey).unwrap();
+            let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
+
+            let rustls_server_config = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier.clone()) // Требуем кастомную проверку клиента!
+                .with_single_cert(vec![cert.clone()], key.clone_key())
+                .unwrap();
+
+            let quic_server_config = QuicServerConfig::try_from(rustls_server_config).unwrap();
+            let server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));;
+
+            let mut ep = Endpoint::new(endpoint_config, Some(server_config), conn.socket.into_std().unwrap(), Arc::new(TokioRuntime)).unwrap();
+            info!("Establishing QUIC connection...");
+            let con = if conn.is_listener {
+                let incoming = ep.accept().await.unwrap();
+                incoming.await.unwrap()
             }
             else {
+                let rustls_client_config = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+                    .with_client_auth_cert(vec![cert.clone()], key.clone_key())
+                    .unwrap();
 
+                let quic_client_config = QuicClientConfig::try_from(rustls_client_config).unwrap();
+                let client_config = ClientConfig::new(Arc::new(quic_client_config));
+                ep.set_default_client_config(client_config);
+
+                let connecting = ep.connect(conn.remote_addr.into(), "reprise-p2p").unwrap();
+                connecting.await.unwrap()
             };
-            info!("Hole-punched connection established with: {}", conn.remote_addr);
-            run_chat_session(conn, &mut stdin_rx).await;
+            run_chat_session(con, conn.is_listener, conn.remote_addr, &mut stdin_rx).await;
             client.add_trusted_remote(peer_key);
             println!("Disconnected. Waiting for new connection...");
         }
@@ -89,15 +131,13 @@ async fn main() {
 }
 
 async fn run_chat_session(
-    conn: p2p_lib::udp::client::NewP2pConnection,
+    con: quinn::Connection,
+    role: bool,
+    remote_addr: SocketAddrV4,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<String>,
 ) {
-    let socket = conn.socket;
-    let peer = conn.remote_addr;
+    println!("=== Chat with {:?} started! Type /exit to quit. ===", remote_addr);
 
-    println!("=== Chat with {:?} started! Type /exit to quit. ===", peer);
-
-    let mut buf = vec![0u8; 2000];
     loop {
         tokio::select! {
             line = stdin_rx.recv() => {
@@ -107,7 +147,8 @@ async fn run_chat_session(
                         break;
                     }
                     Some(msg) => {
-                        if socket.send(msg.as_bytes()).await.is_err() {
+                        let bytes = msg.into_bytes().into();
+                        if con.send_datagram_wait(bytes).await.is_err() {
                             break;
                         }
                     }
@@ -117,10 +158,10 @@ async fn run_chat_session(
                     }
                 }
             }
-            recv = socket.recv(&mut buf) => {
+            recv = con.read_datagram() => {
                 match recv {
-                    Ok(sz) => {
-                        let msg = String::from_utf8_lossy(&buf[..sz]);
+                    Ok(buf) => {
+                        let msg = String::from_utf8_lossy(&buf);
                         println!("<peer> {}", msg);
                     }
                     Err(_) => {
