@@ -98,6 +98,9 @@ impl UdpConnectionEstablisher {
     async fn hole_punch(&self, socket: &UdpSocket, peer: SocketAddrV4) -> bool {
         // Phase 1: Punch exchange (up to 500ms)
         info!("Starting hole punch to {}...", peer);
+        if let Err(e) = socket.connect(peer).await {
+            warn!("Failed to `connect` to {peer} before starting hole punching!");
+        }
         let punch_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut punch_interval = tokio::time::interval(Duration::from_millis(20));
         let mut got_punch = false;
