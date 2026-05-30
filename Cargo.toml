@@ -22,6 +22,7 @@ anyhow = "1.0.102"
 quinn = "0.11.9"
 rcgen = "0.14.8"
 x509-parser = "0.18.1"
+reqwest = "0.13.4"
 
 [dev-dependencies]
 simple_logger = "5.2.0"

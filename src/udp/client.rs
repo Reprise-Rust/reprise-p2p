@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context};
+use chrono::Utc;
 use ed25519_dalek::SigningKey;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use rand::random;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use x509_parser::nom::error::context;
 use crate::udp::messages;
 use crate::udp::messages::{FromServerMessage, PublicKey};
 use crate::udp::quic;
@@ -42,6 +44,14 @@ pub struct NewP2pConnection {
 
 impl UdpConnectionEstablisher {
     pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4) -> UdpConnectionEstablisher {
+        if let Some(error) = check_system_time_error().await {
+            if error > 0.0 {
+                error!("System time invalid! time difference: +{:.02} hours", error);
+            }
+            else {
+                error!("System time invalid! time difference: -{:.02} hours", -error);
+            }
+        }
         UdpConnectionEstablisher {
             last_request_tm: None,
             trusted_remotes: BTreeMap::new(),
@@ -189,7 +199,7 @@ impl UdpConnectionEstablisher {
         if self.last_request_tm.is_none_or(|i| i.elapsed().as_secs() > REQUEST_PLACEMENT_INTERVAL) {
             if let Err(e) = self.place_connection_requests().await {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                return Some(Err(e));
+                return Some(Err(e).context("Placing connection request to P2P server"));
             }
         }
 
@@ -198,7 +208,7 @@ impl UdpConnectionEstablisher {
             match timeout(dur, socket.recv(&mut buf)).await {
                 Ok(Ok(sz)) => {
                     let msg = &buf[..sz];
-                    let res = FromServerMessage::try_parse(msg);
+                    let res = FromServerMessage::try_parse(msg).context("Parsing message from P2P server");
                     if let Ok(msg) = res {
                         match msg {
                             FromServerMessage::InitiateConnectionRequest {
@@ -227,11 +237,11 @@ impl UdpConnectionEstablisher {
                                     let res = self.parent_socket.new_connection(peer_address).await.context(context.clone());
                                     let Ok(socket) = res else {
                                         let Err(e) = res else {unreachable!()};
-                                        return Some(Err(anyhow!(e).context(context)));
+                                        return Some(Err(e));
                                     };
 
                                     if !self.hole_punch(&socket, peer_address).await {
-                                        return Some(Err(anyhow::anyhow!("Hole punch failed for peer {}", peer_address).context(context)));
+                                        return Some(Err(anyhow::anyhow!("Hole punch failed").context(context)));
                                     }
 
                                     return Some(Ok(NewP2pConnection {
@@ -250,11 +260,11 @@ impl UdpConnectionEstablisher {
                     }
                     let Err(e) = res else {unreachable!()};
                     warn!("Cannot parse message from p2p server: {}", e);
-                    Some(Err(anyhow::anyhow!("Cannot parse message from p2p server: {}", e)))
+                    Some(Err(e))
                 }
                 Ok(Err(e)) => {
                     warn!("Failed to receive message from server: {}", e);
-                    Some(Err(anyhow::anyhow!("Failed to receive message from server: {}", e)))
+                    Some(Err(e).context("Receiving message from P2P server"))
                 }
                 Err(_) => {
                     None // no new messages from P2P server
@@ -265,11 +275,35 @@ impl UdpConnectionEstablisher {
             // no p2p connection socket, retry preparing connection to P2P server
             if let Err(e) = self.place_connection_requests().await {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                return Some(Err(e));
+                return Some(Err(e).context("Placing connection request to P2P server"));
             }
             None // was no p2p connection socket but we placed a new one
         }
     }
+}
+
+// If Some => your system time is off by `value` hours from real time
+pub async fn check_system_time_error() -> Option<f32> {
+    let system_time = Utc::now();
+    match tokio::time::timeout(Duration::from_secs(1), reqwest::get(format!("https://timeapi.io/api/v1/time/current/unix"))).await {
+        Err(_) => {
+            // cannot connect to timeapi.io
+        }
+        Ok(Err(e)) => {
+            // request error
+        }
+        Ok(Ok(res)) => {
+            if let Ok(res) = res.text().await {
+                let res = res.strip_prefix("{\"unix_timestamp\":")?;
+                let res = res.strip_suffix("}")?;
+                let tm: i64 = res.parse().ok()?;
+                if tm.abs_diff(system_time.timestamp()) > 5 {
+                    return Some((system_time.timestamp() - tm) as f32 / 3600.0);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// A QUIC connection established over a hole-punched UDP connection.
@@ -323,9 +357,9 @@ impl UdpQuicConnectionEstablisher {
         };
 
         let res = if is_listener {
-            quic::establish_server_quic_connection(ep, &self.signing_key, remote_addr, remote_pubkey).await
+            quic::establish_server_quic_connection(ep, &self.signing_key, remote_addr, remote_pubkey).await.context("Establishing server quic connection")
         } else {
-            quic::establish_client_quic_connection(ep).await
+            quic::establish_client_quic_connection(ep).await.context("Establishing client quic connection")
         };
         let Ok(quic_connection) = res else {
             let Err(e) = res else {unreachable!()};

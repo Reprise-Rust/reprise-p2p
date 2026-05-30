@@ -73,7 +73,7 @@ async fn main() {
                 println!("Disconnected. Waiting for new connection...");
             }
             Some(Err(e)) => {
-                error!("Connection attempt failed: {}", e);
+                error!("Connection attempt failed: {:#?}", e);
                 // Timeout or transient error — just retry
             }
         }
