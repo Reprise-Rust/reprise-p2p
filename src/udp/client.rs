@@ -1,15 +1,18 @@
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::mem;
-use std::net::SocketAddrV4;
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use if_addrs::Interface;
 use log::{debug, error, info, warn};
 use rand::random;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use x509_parser::nom::error::context;
+use crate::p2p_interface_tracker::P2pInterfaceTracker;
 use crate::udp::messages;
 use crate::udp::messages::{FromServerMessage, PublicKey};
 use crate::udp::quic;
@@ -29,6 +32,8 @@ pub struct UdpConnectionEstablisher {
     key: SigningKey,
     session_id: u32,
     socket: UdpSocket,
+    p2p_interface_tracker: P2pInterfaceTracker,
+    cur_interface: Option<String>,
 }
 
 const REQUEST_PLACEMENT_INTERVAL: u64 = 2;
@@ -41,6 +46,34 @@ pub struct NewP2pConnection {
     pub is_listener: bool,
 }
 
+async fn new_udp_socket(best_interface: Option<Interface>) -> UdpSocket {
+    let addr = if cfg!(windows) && let Some(i) = &best_interface {
+        if let IpAddr::V4(addr) = i.addr.ip() {
+            addr
+        }
+        else {
+            // ipv6 addresses were filtered before
+            unreachable!()
+        }
+    }
+    else {
+        Ipv4Addr::UNSPECIFIED
+    };
+
+    let socket = UdpSocket::bind((addr, 0)).await;
+    let Ok(socket) = socket else {
+        // fallback - default socket bind
+        return UdpSocket::bind("0.0.0.0:0").await.unwrap()
+    };
+    #[cfg(not(windows))]
+    if let Some(i) = best_interface {
+        if let Err(e) = socket.bind_device(Some(i.name.as_bytes())) {
+            warn!("Failed to bind socket to specific device {}", i.name)
+        }
+    };
+    socket
+}
+
 impl UdpConnectionEstablisher {
     pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4) -> UdpConnectionEstablisher {
         if let Some(error) = check_system_time_error().await {
@@ -51,13 +84,17 @@ impl UdpConnectionEstablisher {
                 error!("System time invalid! time difference: -{:.02} hours", -error);
             }
         }
+
+        let mut p2p_interface_tracker = P2pInterfaceTracker::new();
         UdpConnectionEstablisher {
             last_request_tm: None,
             trusted_remotes: BTreeMap::new(),
             key,
             p2p_server_addr,
             session_id: random(),
-            socket: UdpSocket::bind("0.0.0.0:0").await.unwrap()
+            socket: new_udp_socket(p2p_interface_tracker.current_interface()).await,
+            cur_interface: p2p_interface_tracker.current_interface().map(|i| i.name),
+            p2p_interface_tracker,
         }
     }
 
@@ -189,6 +226,13 @@ impl UdpConnectionEstablisher {
             return None; // No requests to put on P2P server
         }
 
+        let cur_interface = self.p2p_interface_tracker.current_interface();
+        let cur_interface_name = cur_interface.as_ref().map(|i| i.name.clone());
+        if cur_interface_name != self.cur_interface {
+            self.socket = new_udp_socket(cur_interface).await;
+            self.cur_interface = cur_interface_name;
+        }
+
         if self.last_request_tm.is_none_or(|i| i.elapsed().as_secs() > REQUEST_PLACEMENT_INTERVAL) {
             if let Err(e) = self.place_connection_requests().await {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -227,7 +271,7 @@ impl UdpConnectionEstablisher {
                                 state.last_accepted_session_id = Some(remote_session_id);
                                 
                                 // New valid connection request received from p2p server, swapping sockets and setting up new session id
-                                let socket = mem::replace(&mut self.socket, UdpSocket::bind("0.0.0.0:0").await.unwrap());
+                                let socket = mem::replace(&mut self.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
                                 self.session_id = random();
 
                                 if !self.hole_punch(&socket, peer_address).await {
