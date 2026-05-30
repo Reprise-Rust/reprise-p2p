@@ -8,6 +8,7 @@ use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use if_addrs::Interface;
 use log::{debug, error, info, warn};
+use quinn::rustls;
 use rand::random;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -357,6 +358,7 @@ pub struct UdpQuicConnectionEstablisher {
 
 impl UdpQuicConnectionEstablisher {
     pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4) -> UdpQuicConnectionEstablisher {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         UdpQuicConnectionEstablisher {
             signing_key: key.clone(),
             inner: UdpConnectionEstablisher::new(key, p2p_server_addr).await,
