@@ -98,7 +98,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
 
                                             let to_original = FromServerMessage::InitiateConnectionRequest {
                                                 peer_pubkey: sender_pubkey,
-                                                peer_address: pending.requester_addr,
+                                                peer_address: addr,
                                                 remote_session_id: session_id,
                                                 is_listener: false,
                                             };
