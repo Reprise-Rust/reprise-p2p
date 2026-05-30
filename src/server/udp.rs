@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::time::Instant;
 use chrono::Utc;
 use log::{error, info, warn};
@@ -13,7 +13,7 @@ const SIGNED_MSG_VALID_S: i64 = 10;
 
 struct PendingRequest {
     requester_pubkey: PublicKey,
-    requester_addr: SocketAddr,
+    requester_addr: SocketAddrV4,
     requester_session_id: u32,
     tm: Instant,
 }
@@ -21,12 +21,19 @@ struct PendingRequest {
 struct UdpState {
     /// Map from (requester_pubkey, target_pubkey) to the pending request info.
     requests: HashMap<(PublicKey, PublicKey), PendingRequest>,
+    active_sessions: HashMap<PublicKey, ActiveSession>,
+}
+struct ActiveSession {
+    session_id: u32,
+    remote_addr: SocketAddrV4,
+    remote_peer: PublicKey,
 }
 
 impl UdpState {
     fn new() -> Self {
         Self {
             requests: HashMap::new(),
+            active_sessions: HashMap::new(),
         }
     }
 
@@ -49,6 +56,10 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                         warn!("[Reprise:UDP] Error receiving from socket: {}", e);
                     }
                     Ok((sz, addr)) => {
+                        let SocketAddr::V4(addr) = addr else {
+                            warn!("Ignoring IPv6 message from {}", addr);
+                            continue;
+                        };
                         let msg = &buf[..sz];
                         match ToServerSignedMessage::try_parse(msg) {
                             Err(e) => {
@@ -71,6 +82,15 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
 
                                         let forward_key = (sender_pubkey, peer_pubkey);
                                         let reverse_key = (peer_pubkey, sender_pubkey);
+                                        if let Some(active_session) = state.active_sessions.get(&peer_pubkey) && active_session.session_id == session_id {
+                                            let lost_request_bytes = FromServerMessage::LostConnectionRequest {
+                                                peer_address: active_session.remote_addr,
+                                                peer_pubkey: active_session.remote_peer
+                                            }.to_bytes();
+                                            if let Err(e) = socket.send_to(&lost_request_bytes, addr).await {
+                                                warn!("[Reprise:UDP] Failed to send lost request notification to {}: {}", addr, e);
+                                            }
+                                        }
 
                                         if let Some(pending) = state.requests.remove(&reverse_key) {
                                             // Matching reverse request found — notify both peers and remove both entries.
@@ -78,26 +98,14 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
 
                                             let to_original = FromServerMessage::InitiateConnectionRequest {
                                                 peer_pubkey: sender_pubkey,
-                                                peer_address: match addr {
-                                                    SocketAddr::V4(a) => a,
-                                                    SocketAddr::V6(_) => {
-                                                        warn!("[Reprise:UDP] IPv6 not supported, skipping");
-                                                        continue;
-                                                    }
-                                                },
+                                                peer_address: pending.requester_addr,
                                                 remote_session_id: session_id,
                                                 is_listener: false,
                                             };
 
                                             let to_new = FromServerMessage::InitiateConnectionRequest {
                                                 peer_pubkey: pending.requester_pubkey,
-                                                peer_address: match pending.requester_addr {
-                                                    SocketAddr::V4(a) => a,
-                                                    SocketAddr::V6(_) => {
-                                                        warn!("[Reprise:UDP] IPv6 not supported, skipping");
-                                                        continue;
-                                                    }
-                                                },
+                                                peer_address: pending.requester_addr,
                                                 remote_session_id: pending.requester_session_id,
                                                 is_listener: true
                                             };
@@ -111,6 +119,17 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                             if let Err(e) = socket.send_to(&to_new_bytes, addr).await {
                                                 warn!("[Reprise:UDP] Failed to send to new requester {}: {}", addr, e);
                                             }
+
+                                            state.active_sessions.insert(sender_pubkey, ActiveSession {
+                                                session_id: pending.requester_session_id,
+                                                remote_addr: pending.requester_addr,
+                                                remote_peer: peer_pubkey,
+                                            });
+                                            state.active_sessions.insert(peer_pubkey, ActiveSession {
+                                                session_id,
+                                                remote_addr: addr,
+                                                remote_peer: sender_pubkey,
+                                            });
                                         } else {
                                             // No match yet — store this request.
                                             state.requests.insert(forward_key, PendingRequest {

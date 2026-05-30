@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::mem;
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context};
@@ -12,7 +13,6 @@ use x509_parser::nom::error::context;
 use crate::udp::messages;
 use crate::udp::messages::{FromServerMessage, PublicKey};
 use crate::udp::quic;
-use crate::udp::reusable_udp_socket::ReusableUdpSocket;
 
 struct PeerState {
     /// Whether we're actively trying to connect to this peer.
@@ -28,8 +28,7 @@ pub struct UdpConnectionEstablisher {
     last_request_tm: Option<Instant>,
     key: SigningKey,
     session_id: u32,
-    parent_socket: ReusableUdpSocket,
-    p2p_server_socket: Option<UdpSocket>,
+    socket: UdpSocket,
 }
 
 const REQUEST_PLACEMENT_INTERVAL: u64 = 2;
@@ -58,8 +57,7 @@ impl UdpConnectionEstablisher {
             key,
             p2p_server_addr,
             session_id: random(),
-            parent_socket: ReusableUdpSocket::new(),
-            p2p_server_socket: None,
+            socket: UdpSocket::bind("0.0.0.0:0").await.unwrap()
         }
     }
 
@@ -74,16 +72,9 @@ impl UdpConnectionEstablisher {
         self.trusted_remotes.remove(&key);
     }
 
-    fn start_new_session(&mut self) {
-        self.session_id = random();
-        for trusted_remote in self.trusted_remotes.values_mut() {
-            trusted_remote.active = true;
-        }
-    }
-
     async fn place_connection_requests(&mut self) -> anyhow::Result<()> {
-        self.p2p_server_socket.take();
-        let socket = self.parent_socket.new_connection(self.p2p_server_addr).await.context("Preparing connection to P2P server")?;
+        let socket = &self.socket;
+        socket.connect(&self.p2p_server_addr).await?;
         for (pubkey, state) in &self.trusted_remotes {
             if !state.active {
                 continue;
@@ -97,7 +88,6 @@ impl UdpConnectionEstablisher {
                 warn!("Failed to place connection request: {}", e);
             }
         }
-        self.p2p_server_socket = Some(socket);
         self.last_request_tm = Some(Instant::now());
 
         Ok(())
@@ -204,80 +194,78 @@ impl UdpConnectionEstablisher {
         }
 
         let mut buf = vec![0; 2000];
-        if let Some(ref socket) = self.p2p_server_socket {
-            match timeout(dur, socket.recv(&mut buf)).await {
-                Ok(Ok(sz)) => {
-                    let msg = &buf[..sz];
-                    let res = FromServerMessage::try_parse(msg).context("Parsing message from P2P server");
-                    if let Ok(msg) = res {
-                        match msg {
-                            FromServerMessage::InitiateConnectionRequest {
-                                peer_address,
-                                peer_pubkey,
-                                remote_session_id,
-                                is_listener,
-                            } => {
-                                // use new session id for all future requests
-                                self.start_new_session();
-                                let context = format!("Handling InitiateConnectionRequest from p2p server for peer {}, session_id={}", peer_address, remote_session_id);
-                                if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
-                                    if !state.active {
-                                        debug!("Got duplicate connection notification, ignoring");
-                                        return None;
-                                    }
-
-                                    if state.last_accepted_session_id == Some(remote_session_id) {
-                                        debug!("Got duplicate connection notification with same session_id, ignoring");
-                                        return None;
-                                    }
-
-                                    state.active = false;
-                                    state.last_accepted_session_id = Some(remote_session_id);
-
-                                    let res = self.parent_socket.new_connection(peer_address).await.context(context.clone());
-                                    let Ok(socket) = res else {
-                                        let Err(e) = res else {unreachable!()};
-                                        return Some(Err(e));
-                                    };
-
-                                    if !self.hole_punch(&socket, peer_address).await {
-                                        return Some(Err(anyhow::anyhow!("Hole punch failed").context(context)));
-                                    }
-
-                                    return Some(Ok(NewP2pConnection {
-                                        pubkey: peer_pubkey,
-                                        remote_addr: peer_address,
-                                        socket,
-                                        is_listener,
-                                    }))
+        match timeout(dur, self.socket.recv(&mut buf)).await {
+            Ok(Ok(sz)) => {
+                let msg = &buf[..sz];
+                let res = FromServerMessage::try_parse(msg).context("Parsing message from P2P server");
+                if let Ok(msg) = res {
+                    match msg {
+                        FromServerMessage::InitiateConnectionRequest {
+                            peer_address,
+                            peer_pubkey,
+                            remote_session_id,
+                            is_listener,
+                        } => {
+                            // use new session id for all future requests
+                            let context = format!("Handling InitiateConnectionRequest from p2p server for peer {}, session_id={}", peer_address, remote_session_id);
+                            if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
+                                if !state.active {
+                                    debug!("Got duplicate connection notification, ignoring");
+                                    return None;
                                 }
-                                else {
-                                    debug!("Got connection request from p2p server, but client's pubkey is not in trusted list!");
-                                    return Some(Err(anyhow::anyhow!("Peer pubkey not in trusted list")));
+
+                                if state.last_accepted_session_id == Some(remote_session_id) {
+                                    debug!("Got duplicate connection notification with same session_id, ignoring");
+                                    return None;
                                 }
+
+                                // mark connection as connected (or connection in progress)
+                                state.active = false;
+                                state.last_accepted_session_id = Some(remote_session_id);
+                                
+                                // New valid connection request received from p2p server, swapping sockets and setting up new session id
+                                let socket = mem::replace(&mut self.socket, UdpSocket::bind("0.0.0.0:0").await.unwrap());
+                                self.session_id = random();
+
+                                if !self.hole_punch(&socket, peer_address).await {
+                                    return Some(Err(anyhow::anyhow!("Hole punch failed").context(context)));
+                                }
+
+                                Some(Ok(NewP2pConnection {
+                                    pubkey: peer_pubkey,
+                                    remote_addr: peer_address,
+                                    socket,
+                                    is_listener,
+                                }))
+                            }
+                            else {
+                                debug!("Got connection request from p2p server, but client's pubkey is not in trusted list!");
+                                Some(Err(anyhow::anyhow!("Peer pubkey not in trusted list")))
                             }
                         }
+                        FromServerMessage::LostConnectionRequest {
+                            peer_address,
+                            peer_pubkey
+                        } => {
+                            self.session_id = random();
+                            warn!("Got lost connection notification from {}, new session id assigned", peer_address);
+                            None
+                        }
                     }
+                }
+                else {
                     let Err(e) = res else {unreachable!()};
                     warn!("Cannot parse message from p2p server: {}", e);
                     Some(Err(e))
                 }
-                Ok(Err(e)) => {
-                    warn!("Failed to receive message from server: {}", e);
-                    Some(Err(e).context("Receiving message from P2P server"))
-                }
-                Err(_) => {
-                    None // no new messages from P2P server
-                }
             }
-        }
-        else {
-            // no p2p connection socket, retry preparing connection to P2P server
-            if let Err(e) = self.place_connection_requests().await {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                return Some(Err(e).context("Placing connection request to P2P server"));
+            Ok(Err(e)) => {
+                warn!("Failed to receive message from server: {}", e);
+                Some(Err(e).context("Receiving message from P2P server"))
             }
-            None // was no p2p connection socket but we placed a new one
+            Err(_) => {
+                None // no new messages from P2P server
+            }
         }
     }
 }

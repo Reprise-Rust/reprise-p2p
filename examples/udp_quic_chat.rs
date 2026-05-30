@@ -43,6 +43,7 @@ async fn main() {
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
     let mut client = UdpQuicConnectionEstablisher::new(signing_key.clone(), server_addr).await;
+    client.add_trusted_remote(peer_key);
     println!("Initialized, waiting for connection...");
 
     // Long-running stdin reader — lives for the entire program.
@@ -61,8 +62,6 @@ async fn main() {
     });
 
     loop {
-        // Re-add after each failure to initiate placing connection requests to this remote to p2p server
-        client.add_trusted_remote(peer_key);
         match client.poll_accept(Duration::from_millis(100)).await {
             None => {
                 // just timeout or invalid connection request
@@ -71,6 +70,8 @@ async fn main() {
                 info!("QUIC connection established with: {}", conn.remote_addr);
                 run_chat_session(conn.quic_connection, conn.remote_addr, &mut stdin_rx).await;
                 println!("Disconnected. Waiting for new connection...");
+                // Re-add to re-enable connection requests with this remote
+                client.add_trusted_remote(peer_key);
             }
             Some(Err(e)) => {
                 error!("Connection attempt failed: {:#?}", e);

@@ -202,6 +202,10 @@ pub enum FromServerMessage {
         peer_address: SocketAddrV4,
         remote_session_id: u32,
         is_listener: bool,
+    },
+    LostConnectionRequest {
+        peer_pubkey: PublicKey,
+        peer_address: SocketAddrV4,
     }
 }
 
@@ -238,6 +242,23 @@ impl FromServerMessage {
                     is_listener,
                 }
             }
+            2 => {
+                if bytes.len() < 32 + 4 + 2 {
+                    return Err(ParseError::TooShort);
+                }
+
+                let pubkey = bytes[..32].try_into().unwrap();
+                let bytes = &bytes[32..];
+
+                let ip_addr = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+                let port = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+                let addr = SocketAddrV4::new(ip_addr, port);
+
+                Self::LostConnectionRequest {
+                    peer_pubkey: pubkey,
+                    peer_address: addr,
+                }
+            }
             _ => {
                 return Err(ParseError::InvalidMessageId(msg_id));
             }
@@ -256,6 +277,16 @@ impl FromServerMessage {
                 payload.extend_from_slice(&peer_address.port().to_le_bytes());
                 payload.extend_from_slice(&remote_session_id.to_le_bytes());
                 payload.push(*is_listener as u8);
+
+                payload
+            }
+            Self::LostConnectionRequest { peer_pubkey, peer_address } => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&[2]);
+
+                payload.extend_from_slice(peer_pubkey);
+                payload.extend_from_slice(&peer_address.ip().octets());
+                payload.extend_from_slice(&peer_address.port().to_le_bytes());
 
                 payload
             }
