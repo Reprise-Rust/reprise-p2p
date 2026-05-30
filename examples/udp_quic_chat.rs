@@ -55,7 +55,6 @@ async fn main() {
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
     let mut client = UdpClient::new(signing_key.clone(), server_addr).await;
-    client.add_trusted_remote(peer_key);
 
     // create quinn endpoint
     println!("Remote peer added, waiting for connection...");
@@ -76,6 +75,8 @@ async fn main() {
     });
 
     loop {
+        // Re-add after each failure to initiate placing connection requests to this remote to p2p server
+        client.add_trusted_remote(peer_key);
         if let Some(conn) = client.poll_accept(Duration::from_millis(100)).await {
             info!("Hole-punched connection established with: {}", conn.remote_addr);
 
@@ -85,7 +86,6 @@ async fn main() {
             let res = make_quin_endpoint(&signing_key, conn).await;
             if let Err(e) = res {
                 error!("Failed to prepare QUIC endpoint before connection: {e:?}");
-                client.add_trusted_remote(peer_key);
                 continue;
             }
             let Ok(ep) = res else {
@@ -101,13 +101,11 @@ async fn main() {
             };
             if let Ok(con) = res {
                 run_chat_session(con, is_listener, remote_addr, &mut stdin_rx).await;
+                println!("Disconnected. Waiting for new connection...");
             }
             else if let Err(e) = res {
                 error!("Failed to establish QUIC connection: {e:#?}");
-                continue;
             }
-            client.add_trusted_remote(peer_key);
-            println!("Disconnected. Waiting for new connection...");
         }
     }
 }
