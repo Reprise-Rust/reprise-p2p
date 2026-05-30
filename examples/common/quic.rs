@@ -3,7 +3,6 @@ use std::sync::Arc;
 use anyhow::Error;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use ed25519_dalek::pkcs8::EncodePrivateKey;
-use log::info;
 use quinn::{rustls, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -15,20 +14,20 @@ use rcgen::{CertificateParams, PKCS_ED25519};
 use p2p_lib::udp::client::NewP2pConnection;
 use p2p_lib::udp::messages::PublicKey;
 
-fn quinn_cert_from_key(signing_key: &SigningKey) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let pkcs8_bytes = signing_key.to_pkcs8_der().unwrap();
+fn quinn_cert_from_key(signing_key: &SigningKey) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    let pkcs8_bytes = signing_key.to_pkcs8_der()?;
     let priv_key_der = PrivateKeyDer::Pkcs8(pkcs8_bytes.as_bytes().into());
 
-    let keypair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8_bytes.as_bytes().into(), &PKCS_ED25519).unwrap();
-    let params = CertificateParams::new(vec!["reprise-p2p".to_string()]).unwrap();
-    let cert = params.self_signed(&keypair).unwrap();
+    let keypair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8_bytes.as_bytes().into(), &PKCS_ED25519)?;
+    let params = CertificateParams::new(vec!["reprise-p2p".to_string()])?;
+    let cert = params.self_signed(&keypair)?;
 
-    (cert.der().clone(), priv_key_der.clone_key())
+    Ok((cert.der().clone(), priv_key_der.clone_key()))
 }
 
 pub async fn make_quin_endpoint(signing_key: &SigningKey, conn: NewP2pConnection) -> anyhow::Result<Endpoint> {
     let endpoint_config = EndpointConfig::default();
-    let (cert, key) = quinn_cert_from_key(&signing_key);
+    let (cert, key) = quinn_cert_from_key(&signing_key)?;
 
     let expected_pubkey = VerifyingKey::from_bytes(&conn.pubkey)?;
     let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
@@ -55,7 +54,7 @@ remote_addr: SocketAddrV4, remote_pubkey: PublicKey) -> anyhow::Result<Connectio
     let expected_pubkey = VerifyingKey::from_bytes(&remote_pubkey)?;
     let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
 
-    let (cert, key) = quinn_cert_from_key(&signing_key);
+    let (cert, key) = quinn_cert_from_key(&signing_key)?;
     let rustls_client_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
