@@ -1,24 +1,12 @@
-use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
 use std::time::Duration;
-use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use log::{error, info, Level};
-use quinn::{rustls, ClientConfig, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
-use rcgen::{CertificateParams, PKCS_ED25519};
-use p2p_lib::udp::client::UdpClient;
-use crate::quic::{establish_client_quic_connection, establish_server_quic_connection, make_quin_endpoint, PeerPublicKeyVerifier};
-
-#[path = "common/quic.rs"]
-mod quic;
+use p2p_lib::udp::client::UdpQuicConnectionEstablisher;
 
 #[tokio::main]
 async fn main() {
@@ -54,10 +42,8 @@ async fn main() {
     };
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
-    let mut client = UdpClient::new(signing_key.clone(), server_addr).await;
-
-    // create quinn endpoint
-    println!("Remote peer added, waiting for connection...");
+    let mut client = UdpQuicConnectionEstablisher::new(signing_key.clone(), server_addr).await;
+    println!("Initialized, waiting for connection...");
 
     // Long-running stdin reader — lives for the entire program.
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
@@ -77,34 +63,18 @@ async fn main() {
     loop {
         // Re-add after each failure to initiate placing connection requests to this remote to p2p server
         client.add_trusted_remote(peer_key);
-        if let Some(conn) = client.poll_accept(Duration::from_millis(100)).await {
-            info!("Hole-punched connection established with: {}", conn.remote_addr);
-
-            let is_listener = conn.is_listener;
-            let remote_addr = conn.remote_addr;
-            let remote_pubkey = conn.pubkey;
-            let res = make_quin_endpoint(&signing_key, conn).await;
-            if let Err(e) = res {
-                error!("Failed to prepare QUIC endpoint before connection: {e:?}");
-                continue;
+        match client.poll_accept(Duration::from_millis(100)).await {
+            None => {
+                // just timeout or invalid connection request
             }
-            let Ok(ep) = res else {
-                unreachable!()
-            };
-
-            info!("Establishing QUIC connection...");
-            let res = if is_listener {
-                establish_server_quic_connection(ep, &signing_key, remote_addr, remote_pubkey).await.context("establish server quic connection")
-            }
-            else {
-                establish_client_quic_connection(ep).await.context("establish client quic connection")
-            };
-            if let Ok(con) = res {
-                run_chat_session(con, is_listener, remote_addr, &mut stdin_rx).await;
+            Some(Ok(conn)) => {
+                info!("QUIC connection established with: {}", conn.remote_addr);
+                run_chat_session(conn.quic_connection, conn.remote_addr, &mut stdin_rx).await;
                 println!("Disconnected. Waiting for new connection...");
             }
-            else if let Err(e) = res {
-                error!("Failed to establish QUIC connection: {e:#?}");
+            Some(Err(e)) => {
+                error!("Connection attempt failed: {:#?}", e);
+                // Timeout or transient error — just retry
             }
         }
     }
@@ -112,7 +82,6 @@ async fn main() {
 
 async fn run_chat_session(
     con: quinn::Connection,
-    role: bool,
     remote_addr: SocketAddrV4,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<String>,
 ) {

@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use log::{error, info, Level};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
-use p2p_lib::udp::client::UdpClient;
+use p2p_lib::udp::client::UdpConnectionEstablisher;
 
 #[tokio::main]
 async fn main() {
@@ -42,9 +42,8 @@ async fn main() {
     };
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
-    let mut client = UdpClient::new(signing_key, server_addr).await;
-    client.add_trusted_remote(peer_key);
-    println!("Remote peer added, waiting for connection...");
+    let mut client = UdpConnectionEstablisher::new(signing_key, server_addr).await;
+    println!("Initialized, waiting for connection...");
 
     // Long-running stdin reader — lives for the entire program.
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
@@ -62,11 +61,21 @@ async fn main() {
     });
 
     loop {
-        if let Some(conn) = client.poll_accept(Duration::from_millis(100)).await {
-            info!("Hole-punched connection established with: {}", conn.remote_addr);
-            run_chat_session(conn, &mut stdin_rx).await;
-            client.add_trusted_remote(peer_key);
-            println!("Disconnected. Waiting for new connection...");
+        // Re-add after each failure to initiate placing connection requests to this remote to p2p server
+        client.add_trusted_remote(peer_key);
+        match client.poll_accept(Duration::from_millis(100)).await {
+            None => {
+                // just timeout or invalid connection request
+            }
+            Some(Ok(conn)) => {
+                info!("Hole-punched connection established with: {}", conn.remote_addr);
+                run_chat_session(conn, &mut stdin_rx).await;
+                println!("Disconnected. Waiting for new connection...");
+            }
+            Some(Err(e)) => {
+                error!("Connection attempt failed: {}", e);
+                // Timeout or transient error — just retry
+            }
         }
     }
 }

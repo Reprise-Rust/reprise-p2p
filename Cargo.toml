@@ -19,10 +19,10 @@ ed25519-dalek = { version = "3.0.0-rc.0", features = ["rand_core", "pkcs8", "all
 chrono = "0.4.44"
 socket2 = "0.6.4"
 anyhow = "1.0.102"
+quinn = "0.11.9"
+rcgen = "0.14.8"
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 simple_logger = "5.2.0"
 base64 = "0.22.1"
-quinn = "0.11.9"
-rcgen = "0.14.8"
-x509-parser = "0.18.1"

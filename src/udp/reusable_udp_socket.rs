@@ -29,11 +29,11 @@ impl ReusableUdpSocket {
         Self::new_inner(None)
     }
 
-    pub async fn new_connection(&mut self, remote: SocketAddrV4) -> Option<UdpSocket> {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-        socket.set_reuse_address(true).unwrap();
+    pub async fn new_connection(&mut self, remote: SocketAddrV4) -> anyhow::Result<UdpSocket> {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
         #[cfg(not(windows))]
-        socket.set_reuse_port(true).unwrap();
+        socket.set_reuse_port(true)?;
 
         self.p2p_interface_tracker.get_or_init(P2pInterfaceTracker::new);
         let interface_tracker = self.p2p_interface_tracker.get_mut().unwrap();
@@ -51,17 +51,18 @@ impl ReusableUdpSocket {
         else {
             Ipv4Addr::UNSPECIFIED
         };
-        socket.bind(&SocketAddr::from((addr, self.local_addr().port())).into()).unwrap(); // bind to the same port and correct interface address
+        socket.bind(&SocketAddr::from((addr, self.local_addr().port())).into())?; // bind to the same port and correct interface address
         #[cfg(not(windows))]
         if let Some(i) = best_interface {
-            socket.bind_device(Some(i.name.as_bytes())).unwrap();
+            socket.bind_device(Some(i.name.as_bytes()))?;
         };
 
         let std_socket: std::net::UdpSocket = socket.into();
-        std_socket.set_nonblocking(true).unwrap();
+        std_socket.set_nonblocking(true)?;
 
-        let res = UdpSocket::from_std(std_socket).unwrap();
-        res.connect(remote).await.ok().map(|_| res)
+        let res = UdpSocket::from_std(std_socket)?;
+        res.connect(remote).await?;
+        Ok(res)
     }
 
     pub fn local_addr(&self) -> SocketAddr {

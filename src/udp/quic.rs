@@ -1,20 +1,19 @@
 use std::net::SocketAddrV4;
 use std::sync::Arc;
-use anyhow::Error;
+use anyhow::Context;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use ed25519_dalek::pkcs8::EncodePrivateKey;
-use quinn::{rustls, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use quinn::rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use quinn::rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use quinn::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use quinn::{rustls, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rcgen::{CertificateParams, PKCS_ED25519};
-use p2p_lib::udp::client::NewP2pConnection;
-use p2p_lib::udp::messages::PublicKey;
+use crate::udp::messages::PublicKey;
 
-fn quinn_cert_from_key(signing_key: &SigningKey) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+pub fn quinn_cert_from_key(signing_key: &SigningKey) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let pkcs8_bytes = signing_key.to_pkcs8_der()?;
     let priv_key_der = PrivateKeyDer::Pkcs8(pkcs8_bytes.as_bytes().into());
 
@@ -25,32 +24,36 @@ fn quinn_cert_from_key(signing_key: &SigningKey) -> anyhow::Result<(CertificateD
     Ok((cert.der().clone(), priv_key_der.clone_key()))
 }
 
-pub async fn make_quin_endpoint(signing_key: &SigningKey, conn: NewP2pConnection) -> anyhow::Result<Endpoint> {
+pub async fn make_quin_endpoint(signing_key: &SigningKey, socket: std::net::UdpSocket, expected_pubkey: PublicKey) -> anyhow::Result<Endpoint> {
     let endpoint_config = EndpointConfig::default();
     let (cert, key) = quinn_cert_from_key(&signing_key)?;
 
-    let expected_pubkey = VerifyingKey::from_bytes(&conn.pubkey)?;
+    let expected_pubkey = VerifyingKey::from_bytes(&expected_pubkey)?;
     let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
 
     let rustls_server_config = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier.clone()) // Требуем кастомную проверку клиента!
+        .with_client_cert_verifier(verifier.clone())
         .with_single_cert(vec![cert.clone()], key.clone_key())?;
 
     let quic_server_config = QuicServerConfig::try_from(rustls_server_config)?;
     let server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
 
-    let ep = Endpoint::new(endpoint_config, Some(server_config), conn.socket.into_std()?, Arc::new(TokioRuntime))?;
+    let ep = Endpoint::new(endpoint_config, Some(server_config), socket, Arc::new(TokioRuntime))?;
     Ok(ep)
 }
 
 pub async fn establish_client_quic_connection(ep: Endpoint) -> anyhow::Result<Connection> {
-    let incoming = ep.accept().await.ok_or(Error::msg("Failed to accept connection"))?;
+    let incoming = ep.accept().await.context("Failed to accept QUIC connection")?;
     let con = incoming.await?;
     Ok(con)
 }
-pub async fn establish_server_quic_connection(mut ep: Endpoint,
-                                              signing_key: &SigningKey,
-remote_addr: SocketAddrV4, remote_pubkey: PublicKey) -> anyhow::Result<Connection> {
+
+pub async fn establish_server_quic_connection(
+    mut ep: Endpoint,
+    signing_key: &SigningKey,
+    remote_addr: SocketAddrV4,
+    remote_pubkey: PublicKey,
+) -> anyhow::Result<Connection> {
     let expected_pubkey = VerifyingKey::from_bytes(&remote_pubkey)?;
     let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
 
@@ -68,7 +71,6 @@ remote_addr: SocketAddrV4, remote_pubkey: PublicKey) -> anyhow::Result<Connectio
     let con = connecting.await?;
     Ok(con)
 }
-
 
 #[derive(Debug)]
 pub struct PeerPublicKeyVerifier {
@@ -102,8 +104,6 @@ impl ServerCertVerifier for PeerPublicKeyVerifier {
         Ok(ServerCertVerified::assertion())
     }
 
-    // --- Дальше идет стандартный бойлерплейт для делегирования проверки подписи ---
-
     fn verify_tls12_signature(
         &self,
         message: &[u8],
@@ -129,7 +129,6 @@ impl ServerCertVerifier for PeerPublicKeyVerifier {
     }
 }
 
-
 impl ClientCertVerifier for PeerPublicKeyVerifier {
     fn offer_client_auth(&self) -> bool {
         true
@@ -139,14 +138,12 @@ impl ClientCertVerifier for PeerPublicKeyVerifier {
         &[]
     }
 
-    // Та самая проверка сертификата клиента сервером
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-
         let (_, x509) = x509_parser::parse_x509_certificate(end_entity.as_ref())
             .map_err(|_| rustls::Error::General("Failed to parse X.509 cert".into()))?;
 
@@ -158,8 +155,6 @@ impl ClientCertVerifier for PeerPublicKeyVerifier {
 
         Ok(ClientCertVerified::assertion())
     }
-
-    // --- Бойлерплейт проверки подписей (полностью копируем из ServerCertVerifier) ---
 
     fn verify_tls12_signature(
         &self,
