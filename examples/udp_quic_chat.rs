@@ -3,6 +3,7 @@ use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
+use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -14,21 +15,10 @@ use rand::rngs;
 use rand::rand_core::UnwrapErr;
 use rcgen::{CertificateParams, PKCS_ED25519};
 use p2p_lib::udp::client::UdpClient;
-use crate::quic::PeerPublicKeyVerifier;
+use crate::quic::{establish_client_quic_connection, establish_server_quic_connection, make_quin_endpoint, PeerPublicKeyVerifier};
 
 #[path = "common/quic.rs"]
 mod quic;
-
-fn quinn_cert_from_key(signing_key: &SigningKey) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let pkcs8_bytes = signing_key.to_pkcs8_der().unwrap();
-    let priv_key_der = PrivateKeyDer::Pkcs8(pkcs8_bytes.as_bytes().into());
-
-    let keypair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8_bytes.as_bytes().into(), &PKCS_ED25519).unwrap();
-    let params = CertificateParams::new(vec!["reprise-p2p".to_string()]).unwrap();
-    let cert = params.self_signed(&keypair).unwrap();
-
-    (cert.der().clone(), priv_key_der.clone_key())
-}
 
 #[tokio::main]
 async fn main() {
@@ -89,41 +79,33 @@ async fn main() {
         if let Some(conn) = client.poll_accept(Duration::from_millis(100)).await {
             info!("Hole-punched connection established with: {}", conn.remote_addr);
 
-            let endpoint_config = EndpointConfig::default();
-            let (cert, key) = quinn_cert_from_key(&signing_key);
+            let is_listener = conn.is_listener;
+            let remote_addr = conn.remote_addr;
+            let remote_pubkey = conn.pubkey;
+            let res = make_quin_endpoint(&signing_key, conn).await;
+            if let Err(e) = res {
+                error!("Failed to prepare QUIC endpoint before connection: {e:?}");
+                client.add_trusted_remote(peer_key);
+                continue;
+            }
+            let Ok(ep) = res else {
+                unreachable!()
+            };
 
-            let expected_pubkey = VerifyingKey::from_bytes(&conn.pubkey).unwrap();
-            let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
-
-            let rustls_server_config = rustls::ServerConfig::builder()
-                .with_client_cert_verifier(verifier.clone()) // Требуем кастомную проверку клиента!
-                .with_single_cert(vec![cert.clone()], key.clone_key())
-                .unwrap();
-
-            let quic_server_config = QuicServerConfig::try_from(rustls_server_config).unwrap();
-            let server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));;
-
-            let mut ep = Endpoint::new(endpoint_config, Some(server_config), conn.socket.into_std().unwrap(), Arc::new(TokioRuntime)).unwrap();
             info!("Establishing QUIC connection...");
-            let con = if conn.is_listener {
-                let incoming = ep.accept().await.unwrap();
-                incoming.await.unwrap()
+            let res = if is_listener {
+                establish_server_quic_connection(ep, &signing_key, remote_addr, remote_pubkey).await.context("establish server quic connection")
             }
             else {
-                let rustls_client_config = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(verifier)
-                    .with_client_auth_cert(vec![cert.clone()], key.clone_key())
-                    .unwrap();
-
-                let quic_client_config = QuicClientConfig::try_from(rustls_client_config).unwrap();
-                let client_config = ClientConfig::new(Arc::new(quic_client_config));
-                ep.set_default_client_config(client_config);
-
-                let connecting = ep.connect(conn.remote_addr.into(), "reprise-p2p").unwrap();
-                connecting.await.unwrap()
+                establish_client_quic_connection(ep).await.context("establish client quic connection")
             };
-            run_chat_session(con, conn.is_listener, conn.remote_addr, &mut stdin_rx).await;
+            if let Ok(con) = res {
+                run_chat_session(con, is_listener, remote_addr, &mut stdin_rx).await;
+            }
+            else if let Err(e) = res {
+                error!("Failed to establish QUIC connection: {e:#?}");
+                continue;
+            }
             client.add_trusted_remote(peer_key);
             println!("Disconnected. Waiting for new connection...");
         }

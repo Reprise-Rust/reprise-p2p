@@ -1,10 +1,75 @@
-use ed25519_dalek::VerifyingKey;
-use quinn::rustls;
+use std::net::SocketAddrV4;
+use std::sync::Arc;
+use anyhow::Error;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::pkcs8::EncodePrivateKey;
+use log::info;
+use quinn::{rustls, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use quinn::rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use quinn::rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
-use quinn::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use quinn::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rcgen::{CertificateParams, PKCS_ED25519};
+use p2p_lib::udp::client::NewP2pConnection;
+use p2p_lib::udp::messages::PublicKey;
+
+fn quinn_cert_from_key(signing_key: &SigningKey) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let pkcs8_bytes = signing_key.to_pkcs8_der().unwrap();
+    let priv_key_der = PrivateKeyDer::Pkcs8(pkcs8_bytes.as_bytes().into());
+
+    let keypair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8_bytes.as_bytes().into(), &PKCS_ED25519).unwrap();
+    let params = CertificateParams::new(vec!["reprise-p2p".to_string()]).unwrap();
+    let cert = params.self_signed(&keypair).unwrap();
+
+    (cert.der().clone(), priv_key_der.clone_key())
+}
+
+pub async fn make_quin_endpoint(signing_key: &SigningKey, conn: NewP2pConnection) -> anyhow::Result<Endpoint> {
+    let endpoint_config = EndpointConfig::default();
+    let (cert, key) = quinn_cert_from_key(&signing_key);
+
+    let expected_pubkey = VerifyingKey::from_bytes(&conn.pubkey)?;
+    let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
+
+    let rustls_server_config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier.clone()) // Требуем кастомную проверку клиента!
+        .with_single_cert(vec![cert.clone()], key.clone_key())?;
+
+    let quic_server_config = QuicServerConfig::try_from(rustls_server_config)?;
+    let server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
+
+    let ep = Endpoint::new(endpoint_config, Some(server_config), conn.socket.into_std()?, Arc::new(TokioRuntime))?;
+    Ok(ep)
+}
+
+pub async fn establish_client_quic_connection(ep: Endpoint) -> anyhow::Result<Connection> {
+    let incoming = ep.accept().await.ok_or(Error::msg("Failed to accept connection"))?;
+    let con = incoming.await?;
+    Ok(con)
+}
+pub async fn establish_server_quic_connection(mut ep: Endpoint,
+                                              signing_key: &SigningKey,
+remote_addr: SocketAddrV4, remote_pubkey: PublicKey) -> anyhow::Result<Connection> {
+    let expected_pubkey = VerifyingKey::from_bytes(&remote_pubkey)?;
+    let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
+
+    let (cert, key) = quinn_cert_from_key(&signing_key);
+    let rustls_client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![cert], key)?;
+
+    let quic_client_config = QuicClientConfig::try_from(rustls_client_config)?;
+    let client_config = ClientConfig::new(Arc::new(quic_client_config));
+    ep.set_default_client_config(client_config);
+
+    let connecting = ep.connect(remote_addr.into(), "reprise-p2p")?;
+    let con = connecting.await?;
+    Ok(con)
+}
+
 
 #[derive(Debug)]
 pub struct PeerPublicKeyVerifier {
