@@ -75,6 +75,7 @@ async fn main() {
             }
             Some(Err(e)) => {
                 error!("Connection attempt failed: {:#?}", e);
+                client.add_trusted_remote(peer_key);
                 // Timeout or transient error — just retry
             }
         }
