@@ -1199,32 +1199,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
-name = "p2p-lib"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "bincode",
- "chrono",
- "ctrlc",
- "ed25519-dalek",
- "if-addrs",
- "log",
- "multicast-discovery-socket",
- "parking_lot",
- "quinn",
- "rand 0.10.1",
- "rcgen",
- "reprise-net-util",
- "reqwest",
- "simple_logger",
- "socket2",
- "thiserror 2.0.18",
- "tokio",
- "x509-parser",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1478,6 +1452,32 @@ dependencies = [
  "bincode",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "reprise-p2p"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bincode",
+ "chrono",
+ "ctrlc",
+ "ed25519-dalek",
+ "if-addrs",
+ "log",
+ "multicast-discovery-socket",
+ "parking_lot",
+ "quinn",
+ "rand 0.10.1",
+ "rcgen",
+ "reprise-net-util",
+ "reqwest",
+ "simple_logger",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "x509-parser",
 ]
 
 [[package]]
