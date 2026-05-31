@@ -1,5 +1,6 @@
 use std::net::SocketAddrV4;
 use std::sync::Arc;
+use std::time::Duration;
 use anyhow::Context;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -8,7 +9,7 @@ use quinn::rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use quinn::rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use quinn::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use quinn::{rustls, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
+use quinn::{rustls, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime, TransportConfig};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rcgen::{CertificateParams, PKCS_ED25519};
 use crate::udp::messages::PublicKey;
@@ -31,12 +32,16 @@ pub async fn make_quin_endpoint(signing_key: &SigningKey, socket: std::net::UdpS
     let expected_pubkey = VerifyingKey::from_bytes(&expected_pubkey)?;
     let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
 
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+
     let rustls_server_config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier.clone())
         .with_single_cert(vec![cert.clone()], key.clone_key())?;
 
     let quic_server_config = QuicServerConfig::try_from(rustls_server_config)?;
-    let server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
+    let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
+    server_config.transport_config(Arc::new(transport));
 
     let ep = Endpoint::new(endpoint_config, Some(server_config), socket, Arc::new(TokioRuntime))?;
     Ok(ep)
@@ -64,7 +69,12 @@ pub async fn establish_server_quic_connection(
         .with_client_auth_cert(vec![cert], key)?;
 
     let quic_client_config = QuicClientConfig::try_from(rustls_client_config)?;
-    let client_config = ClientConfig::new(Arc::new(quic_client_config));
+    let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
+
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    client_config.transport_config(Arc::new(transport));
+
     ep.set_default_client_config(client_config);
 
     let connecting = ep.connect(remote_addr.into(), "reprise-p2p")?;
