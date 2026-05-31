@@ -6,7 +6,7 @@ use log::{error, info, warn, Level};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::spawn_blocking;
 use tokio::time;
-use p2p_lib::tcp::P2PTcpConnector;
+use reprise_p2p::tcp::P2PTcpConnector;
 
 #[tokio::main]
 async fn main() {

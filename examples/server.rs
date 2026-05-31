@@ -1,7 +1,7 @@
 use log::Level;
-use p2p_lib::config::ServerConfig;
-use p2p_lib::ctrlc_reg::{ShutdownListener, ShutdownSignal};
-use p2p_lib::server::run_server;
+use reprise_p2p::config::ServerConfig;
+use reprise_p2p::ctrlc_reg::{ShutdownListener, ShutdownSignal};
+use reprise_p2p::server::run_server;
 
 #[tokio::main]
 async fn main() {

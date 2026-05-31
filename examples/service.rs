@@ -4,14 +4,14 @@ use log::{error, info, warn, Level};
 use rand::random;
 use tokio::io::AsyncReadExt;
 use tokio::time;
-use p2p_lib::tcp::{P2PTcpService, RequestError};
+use reprise_p2p::tcp::{P2PTcpService, RequestError};
 
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(Level::Info).unwrap();
     
     let server = (Ipv4Addr::new(155, 212, 168, 136), 47002);
-    let adv_data = p2p_lib::tcp::ClientAnnouncementData {
+    let adv_data = reprise_p2p::tcp::ClientAnnouncementData {
         app: "p2p example".to_string(),
         username: "SkyGrel19".to_string(),
         session: random(),

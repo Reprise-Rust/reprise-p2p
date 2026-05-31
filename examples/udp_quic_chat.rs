@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use log::{error, info, Level};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
-use p2p_lib::udp::client::UdpQuicConnectionEstablisher;
+use reprise_p2p::udp::client::UdpQuicConnectionEstablisher;
 
 #[tokio::main]
 async fn main() {

@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use log::{error, info, Level};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
-use p2p_lib::udp::client::UdpConnectionEstablisher;
+use reprise_p2p::udp::client::UdpConnectionEstablisher;
 
 #[tokio::main]
 async fn main() {
@@ -83,7 +83,7 @@ async fn main() {
 }
 
 async fn run_chat_session(
-    conn: p2p_lib::udp::client::NewP2pConnection,
+    conn: reprise_p2p::udp::client::NewP2pConnection,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<String>,
 ) {
     let socket = conn.socket;
