@@ -141,7 +141,7 @@ impl ToServerSignedMessage {
                 let payload = &payload[1..];
                 let msg = match msg_id {
                     1 => {
-                        if payload.len() < 4 + 32 {
+                        if payload.len() < 4 + 1 {
                             return Err(ParseError::InvalidContentFormat);
                         }
 
@@ -153,6 +153,10 @@ impl ToServerSignedMessage {
                             return Err(ParseError::InvalidContentFormat);
                         }
                         let mut payload = &payload[1..];
+
+                        if payload.len() < 32 * peer_pubkeys_len {
+                            return Err(ParseError::InvalidContentFormat);
+                        }
 
                         let mut peer_pubkeys = Vec::with_capacity(peer_pubkeys_len);
                         for _ in 0..peer_pubkeys_len {
