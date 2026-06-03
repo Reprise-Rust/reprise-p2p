@@ -73,7 +73,7 @@ async fn main() {
                 run_chat_session(conn.quic_connection, conn.remote_addr, &mut stdin_rx).await;
                 println!("Disconnected. Waiting for new connection...");
                 // Re-add to re-enable connection requests with this remote
-                client.add_trusted_remote(peer_key);
+                client.on_connection_closed(peer_key);
             }
             Some(Err(e)) => {
                 error!("Connection attempt failed: {:#?}", e);

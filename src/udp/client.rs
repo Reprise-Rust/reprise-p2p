@@ -1,3 +1,4 @@
+use std::cmp::min;
 use std::collections::{BTreeMap, Bound};
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -17,17 +18,45 @@ use crate::udp::messages;
 use crate::udp::messages::{FromServerMessage, PublicKey};
 use crate::udp::quic;
 
-#[derive(Default)]
+const HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS: u64 = 100;
+const HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS: u64 = 5_000;
+
+enum PeerStateKind {
+    ConnectionActive,
+    Enabled,
+    DisabledUntil(Instant),
+}
+
 struct PeerState {
     /// Whether we're actively trying to connect to this peer.
-    connection_active: bool,
+    state_kind: PeerStateKind,
+    failure_retry_timeout: Duration,
     /// The last `remote_session_id` we accepted from the server for this peer.
     /// Used to ignore duplicate notifications.
     last_accepted_session_id: Option<u32>,
 }
 
+impl PeerState {
+    fn is_discovery_enabled(&self) -> bool {
+        match self.state_kind {
+            PeerStateKind::ConnectionActive => false,
+            PeerStateKind::DisabledUntil(i) => i > Instant::now(),
+            PeerStateKind::Enabled => true,
+        }
+    }
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        Self {
+            state_kind: PeerStateKind::Enabled,
+            failure_retry_timeout: Duration::from_millis(HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS),
+            last_accepted_session_id: None,
+        }
+    }
+}
+
 pub struct UdpConnectionEstablisher {
-    discovery_enabled: bool,
     p2p_server_addr: SocketAddrV4,
     trusted_remotes: BTreeMap<PublicKey, PeerState>,
     last_request_tm: Option<Instant>,
@@ -90,7 +119,6 @@ impl UdpConnectionEstablisher {
 
         let mut p2p_interface_tracker = P2pInterfaceTracker::new();
         UdpConnectionEstablisher {
-            discovery_enabled: true,
             last_request_tm: None,
             trusted_remotes: BTreeMap::new(),
             key,
@@ -124,11 +152,10 @@ impl UdpConnectionEstablisher {
     /// Feedback method. Call this after connection returned by poll_accept failed or closed
     /// This will re-enable discovery for this peer
     pub fn on_connection_closed(&mut self, key: PublicKey) {
-        self.trusted_remotes.entry(key).or_default().connection_active = false;
+        self.trusted_remotes.entry(key).or_default().state_kind = PeerStateKind::Enabled;
     }
 
     pub fn resume_discovery(&mut self) {
-        self.discovery_enabled = true;
         self.last_request_tm = None; // immediately place new requests on next poll
     }
 
@@ -137,7 +164,7 @@ impl UdpConnectionEstablisher {
         let iter_wrap = self.trusted_remotes.range(..self.last_trusted_peer_offset);
 
         let result: Vec<PublicKey> = iter_forward.chain(iter_wrap)
-            .filter(|(_, s)| !s.connection_active)
+            .filter(|(_, s)| s.is_discovery_enabled())
             .take(10)
             .map(|(k, _)| *k)
             .collect();
@@ -267,7 +294,7 @@ impl UdpConnectionEstablisher {
     /// The returned connection has already completed the full hole punch handshake
     /// and is ready for immediate send/recv use.
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<anyhow::Result<NewP2pConnection>> {
-        if self.trusted_remotes.is_empty() || !self.discovery_enabled {
+        if self.trusted_remotes.is_empty() {
             tokio::time::sleep(Duration::from_millis(100)).await;
             return None; // No requests to put on P2P server
         }
@@ -302,7 +329,7 @@ impl UdpConnectionEstablisher {
                             // use new session id for all future requests
                             let context = format!("Handling InitiateConnectionRequest from p2p server for peer {}, session_id={}", peer_address, remote_session_id);
                             if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
-                                if state.connection_active {
+                                if !state.is_discovery_enabled() {
                                     debug!("Got duplicate connection notification, ignoring");
                                     return None;
                                 }
@@ -318,12 +345,15 @@ impl UdpConnectionEstablisher {
                                 self.session_id = random();
 
                                 if !Self::hole_punch(&socket, peer_address).await {
+                                    state.state_kind = PeerStateKind::DisabledUntil(Instant::now() + state.failure_retry_timeout);
+                                    state.failure_retry_timeout += min(state.failure_retry_timeout, Duration::from_secs(1));
+                                    state.failure_retry_timeout = state.failure_retry_timeout.min(Duration::from_millis(HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS));
                                     return Some(Err(anyhow::anyhow!("Hole punch failed").context(context)));
                                 }
 
                                 // mark connection as connected (or connection in progress)
-                                state.connection_active = true;
-                                self.discovery_enabled = false;
+                                state.state_kind = PeerStateKind::ConnectionActive;
+                                state.failure_retry_timeout = Duration::from_millis(HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS);
                                 Some(Ok(NewP2pConnection {
                                     pubkey: peer_pubkey,
                                     remote_addr: peer_address,
@@ -421,6 +451,17 @@ impl UdpQuicConnectionEstablisher {
     pub fn remove_trusted_remote(&mut self, key: PublicKey) {
         self.inner.remove_trusted_remote(key);
     }
+
+    pub fn set_trusted_remote_list(&mut self, new_trusted_remotes: Vec<PublicKey>) {
+        self.inner.set_trusted_remote_list(new_trusted_remotes);
+    }
+
+    /// Feedback method. Call this after connection returned by poll_accept failed or closed
+    /// This will re-enable discovery for this peer
+    pub fn on_connection_closed(&mut self, key: PublicKey) {
+        self.inner.on_connection_closed(key);
+    }
+
 
     /// Block for `dur`, returning a fully established QUIC connection or an error.
     /// Internally performs UDP hole-punching and then establishes a QUIC connection
