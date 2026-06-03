@@ -149,7 +149,7 @@ impl ToServerSignedMessage {
                         let payload = &payload[4..];
 
                         let peer_pubkeys_len = payload[0] as usize;
-                        if peer_pubkeys_len > 10 {
+                        if peer_pubkeys_len > 10 || peer_pubkeys_len == 0{
                             return Err(ParseError::InvalidContentFormat);
                         }
                         let mut payload = &payload[1..];
@@ -187,7 +187,7 @@ impl ToServerSignedMessage {
                 session_id,
                 peer_pubkeys
             } => {
-                if peer_pubkeys.len() > 10 {
+                if peer_pubkeys.len() > 10 || peer_pubkeys.is_empty() {
                     panic!("Cannot encode ConnectionRequest! Maximum 10 peer public keys allowed per message!");
                 }
 

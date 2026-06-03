@@ -155,10 +155,6 @@ impl UdpConnectionEstablisher {
         self.trusted_remotes.entry(key).or_default().state_kind = PeerStateKind::Enabled;
     }
 
-    pub fn resume_discovery(&mut self) {
-        self.last_request_tm = None; // immediately place new requests on next poll
-    }
-
     fn new_available_remotes_list(&mut self) -> Vec<PublicKey> {
         let iter_forward = self.trusted_remotes.range(self.last_trusted_peer_offset..);
         let iter_wrap = self.trusted_remotes.range(..self.last_trusted_peer_offset);
@@ -184,9 +180,7 @@ impl UdpConnectionEstablisher {
 
         result
     }
-    async fn place_connection_requests(&mut self) -> anyhow::Result<()> {
-        let peer_pubkeys_list = self.new_available_remotes_list();
-
+    async fn place_connection_requests(&mut self, peer_pubkeys_list: Vec<PublicKey>) -> anyhow::Result<()> {
         let socket = &self.socket;
         socket.connect(&self.p2p_server_addr).await?;
 
@@ -294,11 +288,6 @@ impl UdpConnectionEstablisher {
     /// The returned connection has already completed the full hole punch handshake
     /// and is ready for immediate send/recv use.
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<anyhow::Result<NewP2pConnection>> {
-        if self.trusted_remotes.is_empty() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            return None; // No requests to put on P2P server
-        }
-
         let cur_interface = self.p2p_interface_tracker.current_interface();
         let cur_interface_name = cur_interface.as_ref().map(|i| i.name.clone());
         if cur_interface_name != self.cur_interface {
@@ -307,7 +296,14 @@ impl UdpConnectionEstablisher {
         }
 
         if self.last_request_tm.is_none_or(|i| i.elapsed().as_secs() > REQUEST_PLACEMENT_INTERVAL) {
-            if let Err(e) = self.place_connection_requests().await {
+            let peer_pubkeys_list = self.new_available_remotes_list();
+
+            if peer_pubkeys_list.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                return None; // No requests to put on P2P server
+            }
+
+            if let Err(e) = self.place_connection_requests(peer_pubkeys_list).await {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 return Some(Err(e).context("Placing connection request to P2P server"));
             }
@@ -348,12 +344,14 @@ impl UdpConnectionEstablisher {
                                     state.state_kind = PeerStateKind::DisabledUntil(Instant::now() + state.failure_retry_timeout);
                                     state.failure_retry_timeout += min(state.failure_retry_timeout, Duration::from_secs(1));
                                     state.failure_retry_timeout = state.failure_retry_timeout.min(Duration::from_millis(HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS));
+                                    self.last_request_tm = None; // retry immediately on next poll
                                     return Some(Err(anyhow::anyhow!("Hole punch failed").context(context)));
                                 }
 
                                 // mark connection as connected (or connection in progress)
                                 state.state_kind = PeerStateKind::ConnectionActive;
                                 state.failure_retry_timeout = Duration::from_millis(HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS);
+                                self.last_request_tm = None; // retry immediately on next poll
                                 Some(Ok(NewP2pConnection {
                                     pubkey: peer_pubkey,
                                     remote_addr: peer_address,
