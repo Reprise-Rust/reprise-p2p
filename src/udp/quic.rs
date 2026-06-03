@@ -25,15 +25,11 @@ pub fn quinn_cert_from_key(signing_key: &SigningKey) -> anyhow::Result<(Certific
     Ok((cert.der().clone(), priv_key_der.clone_key()))
 }
 
-pub async fn make_quin_endpoint(signing_key: &SigningKey, socket: std::net::UdpSocket, expected_pubkey: PublicKey) -> anyhow::Result<Endpoint> {
-    let endpoint_config = EndpointConfig::default();
+pub async fn make_quin_endpoint(endpoint_config: EndpointConfig, transport_config: Arc<TransportConfig>, signing_key: &SigningKey, socket: std::net::UdpSocket, expected_pubkey: PublicKey) -> anyhow::Result<Endpoint> {
     let (cert, key) = quinn_cert_from_key(&signing_key)?;
 
     let expected_pubkey = VerifyingKey::from_bytes(&expected_pubkey)?;
     let verifier = Arc::new(PeerPublicKeyVerifier::new(expected_pubkey));
-
-    let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
 
     let rustls_server_config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier.clone())
@@ -41,7 +37,7 @@ pub async fn make_quin_endpoint(signing_key: &SigningKey, socket: std::net::UdpS
 
     let quic_server_config = QuicServerConfig::try_from(rustls_server_config)?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
-    server_config.transport_config(Arc::new(transport));
+    server_config.transport_config(transport_config);
 
     let ep = Endpoint::new(endpoint_config, Some(server_config), socket, Arc::new(TokioRuntime))?;
     Ok(ep)
@@ -55,6 +51,7 @@ pub async fn establish_client_quic_connection(ep: Endpoint) -> anyhow::Result<Co
 
 pub async fn establish_server_quic_connection(
     mut ep: Endpoint,
+    transport_config: Arc<TransportConfig>,
     signing_key: &SigningKey,
     remote_addr: SocketAddrV4,
     remote_pubkey: PublicKey,
@@ -71,9 +68,7 @@ pub async fn establish_server_quic_connection(
     let quic_client_config = QuicClientConfig::try_from(rustls_client_config)?;
     let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
 
-    let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
-    client_config.transport_config(Arc::new(transport));
+    client_config.transport_config(transport_config);
 
     ep.set_default_client_config(client_config);
 

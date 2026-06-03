@@ -6,7 +6,7 @@ use thiserror::Error;
 pub type PublicKey = [u8; 32];
 pub type Signature = [u8; 64];
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -105,9 +105,10 @@ impl ToServerRawMessage {
 }
 
 pub enum ToServerSignedMessage {
-    /// Place temporary connection slot to the server. Connection will be established on matching connection request from other peer
+    /// Place temporary connection slot to the server. Connection will be established on matching connection request from other peer, included in list. All previous requests are invalidated on receiving this message
+    /// Maximum: 10 connection requests
     ConnectionRequest {
-        peer_pubkey: PublicKey,
+        peer_pubkeys: Vec<PublicKey>,
         session_id: u32
     }
 }
@@ -147,10 +148,22 @@ impl ToServerSignedMessage {
                         let session_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
                         let payload = &payload[4..];
 
-                        let peer_pubkey = payload[..32].try_into().unwrap();
+                        let peer_pubkeys_len = payload[0] as usize;
+                        if peer_pubkeys_len > 10 {
+                            return Err(ParseError::InvalidContentFormat);
+                        }
+                        let mut payload = &payload[1..];
+
+                        let mut peer_pubkeys = Vec::with_capacity(peer_pubkeys_len);
+                        for _ in 0..peer_pubkeys_len {
+                            let peer_pubkey = payload[..32].try_into().unwrap();
+                            peer_pubkeys.push(peer_pubkey);
+                            payload = &payload[32..];
+                        }
+
                         Self::ConnectionRequest {
                             session_id,
-                            peer_pubkey,
+                            peer_pubkeys,
                         }
                     }
                     _ => {
@@ -168,12 +181,19 @@ impl ToServerSignedMessage {
         match self {
             Self::ConnectionRequest {
                 session_id,
-                peer_pubkey
+                peer_pubkeys
             } => {
+                if peer_pubkeys.len() > 10 {
+                    panic!("Cannot encode ConnectionRequest! Maximum 10 peer public keys allowed per message!");
+                }
+
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&[1]);
                 payload.extend_from_slice(&session_id.to_le_bytes());
-                payload.extend_from_slice(peer_pubkey);
+                payload.push(peer_pubkeys.len() as u8);
+                for pubkey in peer_pubkeys {
+                    payload.extend_from_slice(pubkey);
+                }
 
                 let timestamp = Utc::now();
                 let timestamp_ms = timestamp.timestamp_millis();
@@ -203,6 +223,7 @@ pub enum FromServerMessage {
         remote_session_id: u32,
         is_listener: bool,
     },
+    /// Notification about lost connection request, meaning we should regenerate new session id
     LostConnectionRequest {
         peer_pubkey: PublicKey,
         peer_address: SocketAddrV4,

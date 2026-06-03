@@ -1,9 +1,11 @@
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use log::{error, info, Level};
+use quinn::{EndpointConfig, TransportConfig};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
 use reprise_p2p::udp::client::UdpQuicConnectionEstablisher;
@@ -42,7 +44,7 @@ async fn main() {
     };
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
-    let mut client = UdpQuicConnectionEstablisher::new(signing_key.clone(), server_addr).await;
+    let mut client = UdpQuicConnectionEstablisher::new(signing_key.clone(), server_addr, EndpointConfig::default(), Arc::new(TransportConfig::default())).await;
     client.add_trusted_remote(peer_key);
     println!("Initialized, waiting for connection...");
 

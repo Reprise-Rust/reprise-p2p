@@ -1,12 +1,12 @@
+use crate::ctrlc_reg::ShutdownListener;
+use crate::udp::messages::{FromServerMessage, PublicKey, ToServerSignedMessage};
+use chrono::Utc;
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::time::Instant;
-use chrono::Utc;
-use log::{error, info, warn};
 use tokio::net::UdpSocket;
 use tokio::select;
-use crate::ctrlc_reg::ShutdownListener;
-use crate::udp::messages::{FromServerMessage, PublicKey, ToServerSignedMessage};
 
 const REQUEST_TIMEOUT_S: u64 = 10;
 const SIGNED_MSG_VALID_S: i64 = 10;
@@ -20,8 +20,8 @@ struct PendingRequest {
 
 struct UdpState {
     /// Map from (requester_pubkey, target_pubkey) to the pending request info.
-    requests: HashMap<(PublicKey, PublicKey), PendingRequest>,
-    active_sessions: HashMap<PublicKey, ActiveSession>,
+    requests: HashMap<PublicKey, HashMap<PublicKey, PendingRequest>>,
+    last_session_ids: HashMap<PublicKey, ActiveSession>,
 }
 struct ActiveSession {
     session_id: u32,
@@ -33,12 +33,15 @@ impl UdpState {
     fn new() -> Self {
         Self {
             requests: HashMap::new(),
-            active_sessions: HashMap::new(),
+            last_session_ids: HashMap::new(),
         }
     }
 
     fn cleanup(&mut self) {
-        self.requests.retain(|_, v| v.tm.elapsed().as_secs() < REQUEST_TIMEOUT_S);
+        self.requests.retain(|_sender_pubkey, inner_map| {
+            inner_map.retain(|_peer_pubkey, v| v.tm.elapsed().as_secs() < REQUEST_TIMEOUT_S);
+            !inner_map.is_empty()
+        });
     }
 }
 
@@ -75,25 +78,38 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
 
                                 match parsed_msg {
                                     ToServerSignedMessage::ConnectionRequest {
-                                        peer_pubkey,
+                                        peer_pubkeys,
                                         session_id
                                     } => {
                                         state.cleanup();
 
-                                        let forward_key = (sender_pubkey, peer_pubkey);
-                                        let reverse_key = (peer_pubkey, sender_pubkey);
-                                        if let Some(active_session) = state.active_sessions.get(&peer_pubkey) && active_session.session_id == session_id {
+                                        if let Some(active_session) = state.last_session_ids.get(&sender_pubkey) && active_session.session_id == session_id {
                                             let lost_request_bytes = FromServerMessage::LostConnectionRequest {
                                                 peer_address: active_session.remote_addr,
-                                                peer_pubkey: active_session.remote_peer
+                                                peer_pubkey: active_session.remote_peer,
                                             }.to_bytes();
                                             if let Err(e) = socket.send_to(&lost_request_bytes, addr).await {
                                                 warn!("[Reprise:UDP] Failed to send lost request notification to {}: {}", addr, e);
                                             }
+                                            continue;
                                         }
 
-                                        if let Some(pending) = state.requests.remove(&reverse_key) {
-                                            // Matching reverse request found — notify both peers and remove both entries.
+                                        let mut pending_request = None;
+
+                                        for peer_pubkey in &peer_pubkeys {
+                                            if let Some(inner_map) = state.requests.get_mut(peer_pubkey) {
+                                                pending_request = inner_map.remove(&sender_pubkey).map(|req| (peer_pubkey, req))
+                                            }
+                                            if pending_request.is_some() {
+                                                break;
+                                            }
+                                        }
+
+                                        if let Some((peer_pubkey, pending)) = pending_request {
+                                            if let Some(true) = state.requests.get(peer_pubkey).map(|inner| inner.is_empty()) {
+                                                state.requests.remove(peer_pubkey);
+                                            }
+
                                             info!("[Reprise:UDP] Matched connection request between peers");
 
                                             let to_original = FromServerMessage::InitiateConnectionRequest {
@@ -120,24 +136,25 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                                 warn!("[Reprise:UDP] Failed to send to new requester {}: {}", addr, e);
                                             }
 
-                                            state.active_sessions.insert(sender_pubkey, ActiveSession {
+                                            state.last_session_ids.insert(sender_pubkey, ActiveSession {
                                                 session_id: pending.requester_session_id,
                                                 remote_addr: pending.requester_addr,
-                                                remote_peer: peer_pubkey,
+                                                remote_peer: pending.requester_pubkey
                                             });
-                                            state.active_sessions.insert(peer_pubkey, ActiveSession {
-                                                session_id,
-                                                remote_addr: addr,
-                                                remote_peer: sender_pubkey,
-                                            });
-                                        } else {
-                                            // No match yet — store this request.
-                                            state.requests.insert(forward_key, PendingRequest {
-                                                requester_pubkey: sender_pubkey,
-                                                requester_addr: addr,
-                                                requester_session_id: session_id,
-                                                tm: Instant::now(),
-                                            });
+
+                                            state.requests.remove(&sender_pubkey);
+                                        }
+                                        else {
+                                            state.requests.insert(sender_pubkey,
+                                                HashMap::from_iter(peer_pubkeys.into_iter().map(|peer_pubkey| {
+                                                    (peer_pubkey, PendingRequest {
+                                                        requester_pubkey: sender_pubkey,
+                                                        requester_addr: addr,
+                                                        requester_session_id: session_id,
+                                                        tm: Instant::now(),
+                                                    })
+                                                }))
+                                            );
                                         }
                                     }
                                 }

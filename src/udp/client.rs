@@ -1,32 +1,33 @@
-use std::cell::OnceCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, Bound};
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use if_addrs::Interface;
 use log::{debug, error, info, warn};
-use quinn::rustls;
+use quinn::{rustls, EndpointConfig, TransportConfig};
 use rand::random;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
-use x509_parser::nom::error::context;
 use crate::p2p_interface_tracker::P2pInterfaceTracker;
 use crate::udp::messages;
 use crate::udp::messages::{FromServerMessage, PublicKey};
 use crate::udp::quic;
 
+#[derive(Default)]
 struct PeerState {
     /// Whether we're actively trying to connect to this peer.
-    active: bool,
+    connection_active: bool,
     /// The last `remote_session_id` we accepted from the server for this peer.
     /// Used to ignore duplicate notifications.
     last_accepted_session_id: Option<u32>,
 }
 
 pub struct UdpConnectionEstablisher {
+    discovery_enabled: bool,
     p2p_server_addr: SocketAddrV4,
     trusted_remotes: BTreeMap<PublicKey, PeerState>,
     last_request_tm: Option<Instant>,
@@ -35,6 +36,7 @@ pub struct UdpConnectionEstablisher {
     socket: UdpSocket,
     p2p_interface_tracker: P2pInterfaceTracker,
     cur_interface: Option<String>,
+    last_trusted_peer_offset: PublicKey,
 }
 
 const REQUEST_PLACEMENT_INTERVAL: u64 = 2;
@@ -88,6 +90,7 @@ impl UdpConnectionEstablisher {
 
         let mut p2p_interface_tracker = P2pInterfaceTracker::new();
         UdpConnectionEstablisher {
+            discovery_enabled: true,
             last_request_tm: None,
             trusted_remotes: BTreeMap::new(),
             key,
@@ -96,35 +99,77 @@ impl UdpConnectionEstablisher {
             socket: new_udp_socket(p2p_interface_tracker.current_interface()).await,
             cur_interface: p2p_interface_tracker.current_interface().map(|i| i.name),
             p2p_interface_tracker,
+            last_trusted_peer_offset: PublicKey::default(),
         }
     }
 
     pub fn add_trusted_remote(&mut self, key: PublicKey) {
-        self.trusted_remotes.insert(key, PeerState {
-            active: true,
-            last_accepted_session_id: None,
-        });
+        self.trusted_remotes.entry(key).or_default();
     }
 
+    /// This will re-enable discovery for this peer
     pub fn remove_trusted_remote(&mut self, key: PublicKey) {
         self.trusted_remotes.remove(&key);
     }
 
+    pub fn set_trusted_remote_list(&mut self, new_trusted_remotes: Vec<PublicKey>) {
+        // add new
+        for trusted in &new_trusted_remotes {
+            self.trusted_remotes.entry(*trusted).or_default();
+        }
+        // remove old
+        self.trusted_remotes.retain(|k, _| new_trusted_remotes.contains(k));
+    }
+
+    /// Feedback method. Call this after connection returned by poll_accept failed or closed
+    /// This will re-enable discovery for this peer
+    pub fn on_connection_closed(&mut self, key: PublicKey) {
+        self.trusted_remotes.entry(key).or_default().connection_active = false;
+    }
+
+    pub fn resume_discovery(&mut self) {
+        self.discovery_enabled = true;
+        self.last_request_tm = None; // immediately place new requests on next poll
+    }
+
+    fn new_available_remotes_list(&mut self) -> Vec<PublicKey> {
+        let iter_forward = self.trusted_remotes.range(self.last_trusted_peer_offset..);
+        let iter_wrap = self.trusted_remotes.range(..self.last_trusted_peer_offset);
+
+        let result: Vec<PublicKey> = iter_forward.chain(iter_wrap)
+            .filter(|(_, s)| !s.connection_active)
+            .take(10)
+            .map(|(k, _)| *k)
+            .collect();
+
+        if let Some(last_key) = result.last() {
+            let next_entry = self.trusted_remotes
+                .range((Bound::Excluded(*last_key), Bound::Unbounded))
+                .next();
+
+            self.last_trusted_peer_offset = match next_entry {
+                Some((k, _)) => *k,
+                None => {
+                    *self.trusted_remotes.keys().next().unwrap_or(last_key)
+                }
+            };
+        }
+
+        result
+    }
     async fn place_connection_requests(&mut self) -> anyhow::Result<()> {
+        let peer_pubkeys_list = self.new_available_remotes_list();
+
         let socket = &self.socket;
         socket.connect(&self.p2p_server_addr).await?;
-        for (pubkey, state) in &self.trusted_remotes {
-            if !state.active {
-                continue;
-            }
-            let payload = messages::ToServerSignedMessage::ConnectionRequest {
-                peer_pubkey: *pubkey,
-                session_id: self.session_id,
-            }.to_bytes(&self.key);
-            let res = socket.send(&payload).await;
-            if let Err(e) = res {
-                warn!("Failed to place connection request: {}", e);
-            }
+
+        let payload = messages::ToServerSignedMessage::ConnectionRequest {
+            peer_pubkeys: peer_pubkeys_list,
+            session_id: self.session_id,
+        }.to_bytes(&self.key);
+        let res = socket.send(&payload).await;
+        if let Err(e) = res {
+            warn!("Failed to place connection request: {}", e);
         }
         self.last_request_tm = Some(Instant::now());
 
@@ -133,7 +178,7 @@ impl UdpConnectionEstablisher {
 
     /// Perform the full hole punch handshake on the given socket.
     /// Returns `true` if the hole was successfully punched.
-    async fn hole_punch(&self, socket: &UdpSocket, peer: SocketAddrV4) -> bool {
+    async fn hole_punch(socket: &UdpSocket, peer: SocketAddrV4) -> bool {
         // Phase 1: Punch exchange (up to 500ms)
         info!("Starting hole punch to {}...", peer);
         if let Err(e) = socket.connect(peer).await {
@@ -222,7 +267,7 @@ impl UdpConnectionEstablisher {
     /// The returned connection has already completed the full hole punch handshake
     /// and is ready for immediate send/recv use.
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<anyhow::Result<NewP2pConnection>> {
-        if self.trusted_remotes.is_empty() {
+        if self.trusted_remotes.is_empty() || !self.discovery_enabled {
             tokio::time::sleep(Duration::from_millis(100)).await;
             return None; // No requests to put on P2P server
         }
@@ -257,7 +302,7 @@ impl UdpConnectionEstablisher {
                             // use new session id for all future requests
                             let context = format!("Handling InitiateConnectionRequest from p2p server for peer {}, session_id={}", peer_address, remote_session_id);
                             if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
-                                if !state.active {
+                                if state.connection_active {
                                     debug!("Got duplicate connection notification, ignoring");
                                     return None;
                                 }
@@ -266,19 +311,19 @@ impl UdpConnectionEstablisher {
                                     debug!("Got duplicate connection notification with same session_id, ignoring");
                                     return None;
                                 }
-
-                                // mark connection as connected (or connection in progress)
-                                state.active = false;
                                 state.last_accepted_session_id = Some(remote_session_id);
-                                
+
                                 // New valid connection request received from p2p server, swapping sockets and setting up new session id
                                 let socket = mem::replace(&mut self.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
                                 self.session_id = random();
 
-                                if !self.hole_punch(&socket, peer_address).await {
+                                if !Self::hole_punch(&socket, peer_address).await {
                                     return Some(Err(anyhow::anyhow!("Hole punch failed").context(context)));
                                 }
 
+                                // mark connection as connected (or connection in progress)
+                                state.connection_active = true;
+                                self.discovery_enabled = false;
                                 Some(Ok(NewP2pConnection {
                                     pubkey: peer_pubkey,
                                     remote_addr: peer_address,
@@ -354,14 +399,18 @@ pub struct QuicP2pConnection {
 pub struct UdpQuicConnectionEstablisher {
     inner: UdpConnectionEstablisher,
     signing_key: SigningKey,
+    endpoint_config: EndpointConfig,
+    transport_config: Arc<TransportConfig>,
 }
 
 impl UdpQuicConnectionEstablisher {
-    pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4) -> UdpQuicConnectionEstablisher {
+    pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4, endpoint_config: EndpointConfig, transport_config: Arc<TransportConfig>) -> UdpQuicConnectionEstablisher {
         let _ = rustls::crypto::ring::default_provider().install_default();
         UdpQuicConnectionEstablisher {
             signing_key: key.clone(),
             inner: UdpConnectionEstablisher::new(key, p2p_server_addr).await,
+            endpoint_config,
+            transport_config
         }
     }
 
@@ -377,36 +426,38 @@ impl UdpQuicConnectionEstablisher {
     /// Internally performs UDP hole-punching and then establishes a QUIC connection
     /// using the appropriate role (server/client).
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<anyhow::Result<QuicP2pConnection>> {
-        let conn = self.inner.poll_accept(dur).await?;
-        let Ok(conn) = conn else {
-            let Err(e) = conn else {unreachable!()};
-            return Some(Err(e));
+        let conn = match self.inner.poll_accept(dur).await? {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
         };
 
         let remote_addr = conn.remote_addr;
         let remote_pubkey = conn.pubkey;
         let is_listener = conn.is_listener;
 
-        let res = quic::make_quin_endpoint(&self.signing_key, conn.socket.into_std().unwrap(), remote_pubkey).await;
-        let Ok(ep) = res else {
-            let Err(e) = res else {unreachable!()};
-            return Some(Err(e));
+        let ep = match quic::make_quin_endpoint(self.endpoint_config.clone(), self.transport_config.clone(), &self.signing_key, conn.socket.into_std().unwrap(), remote_pubkey).await {
+            Ok(ep) => ep,
+            Err(e) => {
+                self.inner.on_connection_closed(remote_pubkey);
+                return Some(Err(e));
+            }
         };
 
         let res = if is_listener {
-            quic::establish_server_quic_connection(ep, &self.signing_key, remote_addr, remote_pubkey).await.context("Establishing server quic connection")
+            quic::establish_server_quic_connection(ep, self.transport_config.clone(), &self.signing_key, remote_addr, remote_pubkey).await.context("Establishing server quic connection")
         } else {
             quic::establish_client_quic_connection(ep).await.context("Establishing client quic connection")
         };
-        let Ok(quic_connection) = res else {
-            let Err(e) = res else {unreachable!()};
-            return Some(Err(e));
-        };
-
-        Some(Ok(QuicP2pConnection {
-            quic_connection,
-            remote_pubkey,
-            remote_addr,
-        }))
+        match res {
+            Ok(quic_connection) => Some(Ok(QuicP2pConnection {
+                quic_connection,
+                remote_pubkey,
+                remote_addr,
+            })),
+            Err(e) => {
+                self.inner.on_connection_closed(remote_pubkey);
+                Some(Err(e))
+            }
+        }
     }
 }
