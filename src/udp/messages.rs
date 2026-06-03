@@ -47,7 +47,7 @@ impl ToServerRawMessage {
 
         let msg_id = bytes[0];
         let remote_ver = bytes[1];
-        if remote_ver > PROTOCOL_VERSION {
+        if remote_ver != PROTOCOL_VERSION {
             return Err(ParseError::UnsupportedVersion {
                 cur: PROTOCOL_VERSION,
                 remote: remote_ver,
