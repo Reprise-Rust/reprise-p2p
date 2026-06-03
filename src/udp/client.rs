@@ -40,7 +40,7 @@ impl PeerState {
     fn is_discovery_enabled(&self) -> bool {
         match self.state_kind {
             PeerStateKind::ConnectionActive => false,
-            PeerStateKind::DisabledUntil(i) => i > Instant::now(),
+            PeerStateKind::DisabledUntil(i) => i < Instant::now(),
             PeerStateKind::Enabled => true,
         }
     }
