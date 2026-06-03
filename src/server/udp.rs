@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 use tokio::select;
 
 const REQUEST_TIMEOUT_S: u64 = 10;
-const SIGNED_MSG_VALID_S: i64 = 10;
+const SIGNED_MSG_VALID_S: i64 = 30;
 
 struct PendingRequest {
     requester_pubkey: PublicKey,
