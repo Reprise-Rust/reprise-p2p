@@ -110,7 +110,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                                 state.requests.remove(peer_pubkey);
                                             }
 
-                                            info!("[Reprise:UDP] Matched connection request between peers");
+                                            info!("[Reprise:UDP] Matched connection request: {:?} at {} <-> {:?} at {}", pending.requester_pubkey, pending.requester_addr, sender_pubkey, addr);
 
                                             let to_original = FromServerMessage::InitiateConnectionRequest {
                                                 peer_pubkey: sender_pubkey,

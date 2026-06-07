@@ -103,6 +103,8 @@ impl P2PTcpService {
 
                     match time::timeout(Duration::from_secs(1), socket.connect(remote_addr)).await {
                         Ok(Ok(con)) =>  {
+                            let local = con.local_addr().ok();
+                            info!("[Reprise:P2P:TCP] Accepted connection from {} (local: {:?})", remote_addr, local);
                             res = Ok((con, remote_addr));
                             break;
                         }

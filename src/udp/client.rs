@@ -280,7 +280,7 @@ impl UdpConnectionEstablisher {
         info!("Drain done, settling...");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        info!("Hole punched with {}!", peer);
+        info!("Hole punched with {} (local: {:?})!", peer, socket.local_addr().ok());
         true
     }
 
@@ -488,11 +488,14 @@ impl UdpQuicConnectionEstablisher {
             quic::establish_client_quic_connection(ep).await.context("Establishing client quic connection")
         };
         match res {
-            Ok(quic_connection) => Some(Ok(QuicP2pConnection {
-                quic_connection,
-                remote_pubkey,
-                remote_addr,
-            })),
+            Ok(quic_connection) => {
+                info!("[Reprise:P2P:UDP:QUIC] Connection established with {:?} (remote: {})", remote_pubkey, remote_addr);
+                Some(Ok(QuicP2pConnection {
+                    quic_connection,
+                    remote_pubkey,
+                    remote_addr,
+                }))
+            }
             Err(e) => {
                 self.inner.on_connection_closed(remote_pubkey);
                 Some(Err(e))

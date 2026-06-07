@@ -155,6 +155,8 @@ impl P2PTcpConnector {
                     trace!("[Reprise:P2P:TCP] Connecting to {:?}!", remote_addr);
                     match time::timeout(Duration::from_secs(1), socket.connect(remote_addr)).await {
                         Ok(Ok(con)) => {
+                            let local = con.local_addr().ok();
+                            info!("[Reprise:P2P:TCP] Connected to {} (local: {:?})", remote_addr, local);
                             res = Ok((con, remote_addr));
                             break;
                         }
