@@ -1,7 +1,7 @@
 use std::cmp::min;
 use std::collections::{BTreeMap, Bound};
 use std::mem;
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::Context;
@@ -198,17 +198,20 @@ impl UdpConnectionEstablisher {
     }
 
     /// Perform the full hole punch handshake on the given socket.
-    /// Returns `true` if the hole was successfully punched.
-    async fn hole_punch(socket: &UdpSocket, peer: SocketAddrV4) -> bool {
-        // Phase 1: Punch exchange (up to 500ms)
+    /// Returns the actual peer address (may differ from `peer` under symmetric NAT)
+    /// if the hole was successfully punched.
+    ///
+    /// Uses `send_to`/`recv_from` instead of `connect` so we can discover the peer's
+    /// actual source port. This is required for symmetric NAT traversal: when a peer
+    /// behind symmetric NAT sends to us, the source port we see differs from the
+    /// server-reported port. We must reply to the actual source port.
+    async fn hole_punch(socket: &UdpSocket, peer: SocketAddrV4) -> Option<SocketAddrV4> {
         info!("Starting hole punch to {}...", peer);
-        if let Err(e) = socket.connect(peer).await {
-            warn!("Failed to `connect` to {peer} before starting hole punching!");
-        }
         let punch_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut punch_interval = tokio::time::interval(Duration::from_millis(20));
         let mut got_punch = false;
         let mut got_punch_ack = false;
+        let mut actual_peer_addr: Option<SocketAddrV4> = None;
 
         let mut buf = vec![0u8; 2000];
         loop {
@@ -222,21 +225,26 @@ impl UdpConnectionEstablisher {
 
             tokio::select! {
                 _ = punch_interval.tick() => {
-                    if let Err(e) = socket.send(b"punch").await {
+                    if let Err(e) = socket.send_to(b"punch", peer).await {
                         warn!("Error sending punch message: {:?}", e)
                     }
                 }
-                recv = socket.recv(&mut buf) => {
+                recv = socket.recv_from(&mut buf) => {
                     match recv {
-                        Ok(sz) => {
+                        Ok((sz, src)) => {
+                            let SocketAddr::V4(src) = src else {
+                                continue;
+                            };
                             let msg = &buf[..sz];
                             if msg == b"punch" {
-                                info!("Received punch from {}, sending ack", peer);
-                                let _ = socket.send(b"punch ack").await;
+                                info!("Received punch from {} (expected {}), sending ack", src, peer);
+                                let _ = socket.send_to(b"punch ack", src).await;
                                 got_punch = true;
+                                actual_peer_addr = Some(src);
                             } else if msg == b"punch ack" {
-                                info!("Received punch ack from {}", peer);
+                                info!("Received punch ack from {} (expected {})", src, peer);
                                 got_punch_ack = true;
+                                actual_peer_addr = Some(src);
                             }
                         }
                         Err(e) => {
@@ -247,9 +255,11 @@ impl UdpConnectionEstablisher {
             }
         }
 
+        let actual_peer_addr = actual_peer_addr?;
+
         if !got_punch || !got_punch_ack {
             warn!("Hole punching failed (timeout) — got_punch={}, got_punch_ack={}", got_punch, got_punch_ack);
-            return false;
+            return None;
         }
 
         // Phase 2: Drain remaining punch/ack packets (200ms)
@@ -260,8 +270,8 @@ impl UdpConnectionEstablisher {
             if now >= drain_deadline {
                 break;
             }
-            match tokio::time::timeout_at(drain_deadline, socket.recv(&mut buf)).await {
-                Ok(Ok(sz)) => {
+            match tokio::time::timeout_at(drain_deadline, socket.recv_from(&mut buf)).await {
+                Ok(Ok((sz, _src))) => {
                     let msg = &buf[..sz];
                     if msg != b"punch" && msg != b"punch ack" {
                         warn!("Unexpected packet during drain: {:?}", msg);
@@ -280,8 +290,8 @@ impl UdpConnectionEstablisher {
         info!("Drain done, settling...");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        info!("Hole punched with {} (local: {:?})!", peer, socket.local_addr().ok());
-        true
+        info!("Hole punched with {} (local: {:?})!", actual_peer_addr, socket.local_addr().ok());
+        Some(actual_peer_addr)
     }
 
     /// Block for `dur`, returning a new hole-punched connection or an error.
@@ -340,13 +350,16 @@ impl UdpConnectionEstablisher {
                                 let socket = mem::replace(&mut self.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
                                 self.session_id = random();
 
-                                if !Self::hole_punch(&socket, peer_address).await {
-                                    state.state_kind = PeerStateKind::DisabledUntil(Instant::now() + state.failure_retry_timeout);
-                                    state.failure_retry_timeout += min(state.failure_retry_timeout, Duration::from_secs(1));
-                                    state.failure_retry_timeout = state.failure_retry_timeout.min(Duration::from_millis(HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS));
-                                    self.last_request_tm = None; // retry immediately on next poll
-                                    return Some(Err(anyhow::anyhow!("Hole punch failed").context(context)));
-                                }
+                                let actual_peer_addr = match Self::hole_punch(&socket, peer_address).await {
+                                    Some(addr) => addr,
+                                    None => {
+                                        state.state_kind = PeerStateKind::DisabledUntil(Instant::now() + state.failure_retry_timeout);
+                                        state.failure_retry_timeout += min(state.failure_retry_timeout, Duration::from_secs(1));
+                                        state.failure_retry_timeout = state.failure_retry_timeout.min(Duration::from_millis(HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS));
+                                        self.last_request_tm = None; // retry immediately on next poll
+                                        return Some(Err(anyhow::anyhow!("Hole punch failed").context(context)));
+                                    }
+                                };
 
                                 // mark connection as connected (or connection in progress)
                                 state.state_kind = PeerStateKind::ConnectionActive;
@@ -354,7 +367,7 @@ impl UdpConnectionEstablisher {
                                 self.last_request_tm = None; // retry immediately on next poll
                                 Some(Ok(NewP2pConnection {
                                     pubkey: peer_pubkey,
-                                    remote_addr: peer_address,
+                                    remote_addr: actual_peer_addr,
                                     socket,
                                     is_listener,
                                 }))
