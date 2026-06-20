@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 use base64::Engine;
@@ -85,7 +85,7 @@ async fn main() {
 
 async fn run_chat_session(
     con: quinn::Connection,
-    remote_addr: SocketAddrV4,
+    remote_addr: SocketAddr,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<String>,
 ) {
     println!("=== Chat with {:?} started! Type /exit to quit. ===", remote_addr);

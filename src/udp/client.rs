@@ -73,7 +73,7 @@ const REQUEST_PLACEMENT_INTERVAL: u64 = 2;
 /// A fully hole-punched, ready-to-use P2P connection.
 pub struct NewP2pConnection {
     pub pubkey: PublicKey,
-    pub remote_addr: SocketAddrV4,
+    pub remote_addr: SocketAddr,
     pub socket: UdpSocket,
     pub is_listener: bool,
 }
@@ -205,13 +205,13 @@ impl UdpConnectionEstablisher {
     /// actual source port. This is required for symmetric NAT traversal: when a peer
     /// behind symmetric NAT sends to us, the source port we see differs from the
     /// server-reported port. We must reply to the actual source port.
-    async fn hole_punch(socket: &UdpSocket, peer: SocketAddrV4) -> Option<SocketAddrV4> {
+    async fn hole_punch(socket: &UdpSocket, peer: SocketAddrV4) -> Option<SocketAddr> {
         info!("Starting hole punch to {}...", peer);
         let punch_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut punch_interval = tokio::time::interval(Duration::from_millis(20));
         let mut got_punch = false;
         let mut got_punch_ack = false;
-        let mut actual_peer_addr: Option<SocketAddrV4> = None;
+        let mut actual_peer_addr: Option<SocketAddr> = None;
 
         let mut buf = vec![0u8; 2000];
         loop {
@@ -232,9 +232,6 @@ impl UdpConnectionEstablisher {
                 recv = socket.recv_from(&mut buf) => {
                     match recv {
                         Ok((sz, src)) => {
-                            let SocketAddr::V4(src) = src else {
-                                continue;
-                            };
                             let msg = &buf[..sz];
                             if msg == b"punch" {
                                 info!("Received punch from {} (expected {}), sending ack", src, peer);
@@ -432,7 +429,7 @@ pub async fn check_system_time_error() -> Option<f32> {
 pub struct QuicP2pConnection {
     pub quic_connection: quinn::Connection,
     pub remote_pubkey: PublicKey,
-    pub remote_addr: SocketAddrV4,
+    pub remote_addr: SocketAddr,
 }
 
 /// Wraps `UdpConnectionEstablisher` and additionally establishes a QUIC connection

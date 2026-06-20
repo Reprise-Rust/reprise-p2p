@@ -1,4 +1,4 @@
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::Context;
@@ -53,7 +53,7 @@ pub async fn establish_server_quic_connection(
     mut ep: Endpoint,
     transport_config: Arc<TransportConfig>,
     signing_key: &SigningKey,
-    remote_addr: SocketAddrV4,
+    remote_addr: SocketAddr,
     remote_pubkey: PublicKey,
 ) -> anyhow::Result<Connection> {
     let expected_pubkey = VerifyingKey::from_bytes(&remote_pubkey)?;
@@ -72,7 +72,7 @@ pub async fn establish_server_quic_connection(
 
     ep.set_default_client_config(client_config);
 
-    let connecting = ep.connect(remote_addr.into(), "reprise-p2p")?;
+    let connecting = ep.connect(remote_addr, "reprise-p2p")?;
     let con = connecting.await?;
     Ok(con)
 }
