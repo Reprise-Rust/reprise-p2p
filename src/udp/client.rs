@@ -241,6 +241,7 @@ impl UdpConnectionEstablisher {
         let mut punch_interval = tokio::time::interval(Duration::from_millis(20));
         let mut got_punch = false;
         let mut got_punch_ack = false;
+        info!("Local hole-punching socket addr: {:?}", socket.local_addr());
 
         let mut buf = vec![0u8; 2000];
         loop {
