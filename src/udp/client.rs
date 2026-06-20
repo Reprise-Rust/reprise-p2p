@@ -210,13 +210,12 @@ impl UdpConnectionEstablisher {
     }
     async fn place_connection_requests(&mut self, peer_pubkeys_list: Vec<PublicKey>) -> anyhow::Result<()> {
         let socket = &self.socket;
-        socket.connect(&self.p2p_server_addr).await?;
 
         let payload = messages::ToServerSignedMessage::ConnectionRequest {
             peer_pubkeys: peer_pubkeys_list,
             session_id: self.session_id,
         }.to_bytes(&self.key);
-        let res = socket.send(&payload).await;
+        let res = socket.send_to(&payload, self.p2p_server_addr).await;
         if let Err(e) = res {
             warn!("Failed to place connection request: {}", e);
         }
@@ -241,7 +240,6 @@ impl UdpConnectionEstablisher {
         let mut punch_interval = tokio::time::interval(Duration::from_millis(20));
         let mut got_punch = false;
         let mut got_punch_ack = false;
-        info!("Local hole-punching socket addr: {:?}", socket.local_addr());
 
         let mut buf = vec![0u8; 2000];
         loop {
@@ -349,8 +347,12 @@ impl UdpConnectionEstablisher {
         }
 
         let mut buf = vec![0; 2000];
-        match timeout(dur, self.socket.recv(&mut buf)).await {
-            Ok(Ok(sz)) => {
+        match timeout(dur, self.socket.recv_from(&mut buf)).await {
+            Ok(Ok((sz, addr))) => {
+                if addr != self.p2p_server_addr.into() {
+                    warn!("Ignoring UDP packet not from p2p server");
+                    return None;
+                }
                 let msg = &buf[..sz];
                 let res = FromServerMessage::try_parse(msg).context("Parsing message from P2P server");
                 if let Ok(msg) = res {
