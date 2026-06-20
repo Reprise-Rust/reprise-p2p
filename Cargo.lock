@@ -1446,8 +1446,8 @@ dependencies = [
 
 [[package]]
 name = "reprise-net-util"
-version = "0.1.0"
-source = "git+https://github.com/Reprise-Rust/reprise-net-util.git#9770be53cae10d5487dece09d4875079a34e7fad"
+version = "0.1.1"
+source = "git+https://github.com/Reprise-Rust/reprise-net-util.git#d62bab73db1bdfaca25fa284a3d678e1b8018281"
 dependencies = [
  "bincode",
  "thiserror 1.0.69",

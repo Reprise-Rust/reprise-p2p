@@ -114,11 +114,14 @@ async fn handle_tcp_client(stream: TcpStream, addr: SocketAddr, state: State) {
                 ChannelError::ConnectionClosed => {
                     break;
                 }
+                e if e.is_critical() => {
+                    error!("[Reprise:P2P:TCP] Error receiving message from client {:?}: {:?}", addr, e);
+                    break;
+                }
                 e => {
                     warn!("[Reprise:P2P:TCP] Error receiving message from client {:?}: {:?}", addr, e);
                 }
             }
-
         }
     }
 }
