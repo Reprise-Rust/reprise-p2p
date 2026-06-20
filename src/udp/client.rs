@@ -118,13 +118,13 @@ impl Display for HolePunchError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if !self.got_ack && !self.got_punch {
 
-            f.write_str("")
+            f.write_str("Did not receive packets from client at all!")
         }
         else if self.got_ack {
-            f.write_str("")
+            f.write_str("We got ack from client, but missed punch packet (strange)")
         }
         else {
-            f.write_str("")
+            f.write_str("We got punch but did not receive ack")
         }
     }
 }
