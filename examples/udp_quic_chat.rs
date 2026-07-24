@@ -44,7 +44,7 @@ async fn main() {
     };
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
-    let mut client = UdpQuicConnectionEstablisher::new(signing_key.clone(), server_addr, EndpointConfig::default(), Arc::new(TransportConfig::default())).await;
+    let mut client = UdpQuicConnectionEstablisher::new(signing_key.clone(), server_addr, None, EndpointConfig::default(), Arc::new(TransportConfig::default())).await;
     client.add_trusted_remote(peer_key);
     println!("Initialized, waiting for connection...");
 

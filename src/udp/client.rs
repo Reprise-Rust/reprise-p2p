@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::{BTreeMap, Bound};
 use std::fmt::{Debug, Display, Formatter};
@@ -10,6 +11,8 @@ use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use if_addrs::Interface;
 use log::{debug, error, info, warn};
+use multicast_discovery_socket::config::MulticastDiscoveryConfig;
+use multicast_discovery_socket::MulticastDiscoverySocket;
 use quinn::{rustls, EndpointConfig, TransportConfig};
 use rand::random;
 use thiserror::Error;
@@ -58,6 +61,23 @@ impl Default for PeerState {
     }
 }
 
+#[derive(Clone, bincode::Encode, bincode::Decode)]
+pub struct DiscoveryPublicData {
+    buf: Vec<u8>,
+    pubkey: PublicKey,
+    discovery_obs_key: String
+}
+
+impl DiscoveryPublicData {
+    pub fn from_obf_key(pubkey: PublicKey, discovery_obs_key: String) -> Self {
+        Self {
+            pubkey,
+            discovery_obs_key,
+            buf: Vec::new(),
+        }
+    }
+}
+
 pub struct UdpConnectionEstablisher {
     p2p_server_addr: SocketAddrV4,
     trusted_remotes: BTreeMap<PublicKey, PeerState>,
@@ -68,6 +88,7 @@ pub struct UdpConnectionEstablisher {
     p2p_interface_tracker: P2pInterfaceTracker,
     cur_interface: Option<String>,
     last_trusted_peer_offset: PublicKey,
+    multicast_discovery_socket: Option<MulticastDiscoverySocket<DiscoveryPublicData>>,
 }
 
 const REQUEST_PLACEMENT_INTERVAL: u64 = 2;
@@ -108,6 +129,13 @@ async fn new_udp_socket(best_interface: Option<Interface>) -> UdpSocket {
     socket
 }
 
+pub struct LocalDiscoveryConfig {
+    multicast_group_addr: Ipv4Addr,
+    port: u16,
+    service_name: Cow<'static, str>,
+    obfuscation_key: String,
+}
+
 #[derive(Error)]
 pub struct HolePunchError {
     got_punch: bool,
@@ -135,7 +163,7 @@ impl Debug for HolePunchError {
 }
 
 impl UdpConnectionEstablisher {
-    pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4) -> UdpConnectionEstablisher {
+    pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4, local_discovery_config: Option<LocalDiscoveryConfig>) -> UdpConnectionEstablisher {
         if let Some(error) = check_system_time_error().await {
             if error > 0.0 {
                 error!("System time invalid! time difference: +{:.02} hours", error);
@@ -144,6 +172,14 @@ impl UdpConnectionEstablisher {
                 error!("System time invalid! time difference: -{:.02} hours", -error);
             }
         }
+
+        let multicast_discovery_socket = local_discovery_config.map(|local_discovery_config| {
+            let multicast_discovery_config = &MulticastDiscoveryConfig::new(local_discovery_config.multicast_group_addr, local_discovery_config.service_name);
+            MulticastDiscoverySocket::new_with_service(
+                    multicast_discovery_config,
+                    local_discovery_config.port,
+                    DiscoveryPublicData::from_obf_key(key.to_scalar_bytes(), local_discovery_config.obfuscation_key, )).unwrap()
+        });
 
         let mut p2p_interface_tracker = P2pInterfaceTracker::new();
         UdpConnectionEstablisher {
@@ -156,6 +192,7 @@ impl UdpConnectionEstablisher {
             cur_interface: p2p_interface_tracker.current_interface().map(|i| i.name),
             p2p_interface_tracker,
             last_trusted_peer_offset: PublicKey::default(),
+            multicast_discovery_socket,
         }
     }
 
@@ -476,11 +513,12 @@ pub struct UdpQuicConnectionEstablisher {
 }
 
 impl UdpQuicConnectionEstablisher {
-    pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4, endpoint_config: EndpointConfig, transport_config: Arc<TransportConfig>) -> UdpQuicConnectionEstablisher {
+    pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4, local_discovery_config: Option<LocalDiscoveryConfig>, endpoint_config: EndpointConfig,
+                     transport_config: Arc<TransportConfig>) -> UdpQuicConnectionEstablisher {
         let _ = rustls::crypto::ring::default_provider().install_default();
         UdpQuicConnectionEstablisher {
             signing_key: key.clone(),
-            inner: UdpConnectionEstablisher::new(key, p2p_server_addr).await,
+            inner: UdpConnectionEstablisher::new(key, p2p_server_addr, local_discovery_config).await,
             endpoint_config,
             transport_config
         }
