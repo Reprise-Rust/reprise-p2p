@@ -14,6 +14,7 @@ use log::{debug, error, info, warn};
 use multicast_discovery_socket::config::MulticastDiscoveryConfig;
 use multicast_discovery_socket::{MulticastDiscoverySocket, PollResult};
 use quinn::{rustls, EndpointConfig, TransportConfig};
+use rand::seq::SliceRandom;
 use rand::random;
 use thiserror::Error;
 use tokio::net::UdpSocket;
@@ -25,6 +26,7 @@ use crate::udp::quic;
 
 const HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS: u64 = 100;
 const HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS: u64 = 5_000;
+const SAME_IP_RETRY_TIMEOUT_MS: u64 = 5_000;
 
 enum PeerStateKind {
     ConnectionActive,
@@ -39,6 +41,7 @@ struct PeerState {
     /// The last `remote_session_id` we accepted from the server for this peer.
     /// Used to ignore duplicate notifications.
     last_accepted_session_id: Option<u32>,
+    last_error_same_ip: Option<Instant>,
 }
 
 impl PeerState {
@@ -57,6 +60,7 @@ impl Default for PeerState {
             state_kind: PeerStateKind::Enabled,
             failure_retry_timeout: Duration::from_millis(HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS),
             last_accepted_session_id: None,
+            last_error_same_ip: None
         }
     }
 }
@@ -87,7 +91,6 @@ pub struct UdpConnectionEstablisher {
     socket: UdpSocket,
     p2p_interface_tracker: P2pInterfaceTracker,
     cur_interface: Option<String>,
-    last_trusted_peer_offset: PublicKey,
     multicast_discovery_socket: Option<MulticastDiscoverySocket<DiscoveryPublicData>>,
 }
 
@@ -191,60 +194,64 @@ impl UdpConnectionEstablisher {
             socket: new_udp_socket(p2p_interface_tracker.current_interface()).await,
             cur_interface: p2p_interface_tracker.current_interface().map(|i| i.name),
             p2p_interface_tracker,
-            last_trusted_peer_offset: PublicKey::default(),
             multicast_discovery_socket,
         }
     }
 
     pub fn add_trusted_remote(&mut self, key: PublicKey) {
+        if self.trusted_remotes.get(&key).is_none() {
+            // reset last request tm to send new trusted remotes list as soon as possible
+            self.last_request_tm = None;
+        }
         self.trusted_remotes.entry(key).or_default();
     }
 
     /// This will re-enable discovery for this peer
     pub fn remove_trusted_remote(&mut self, key: PublicKey) {
+        if self.trusted_remotes.get(&key).is_some() {
+            // reset last request tm to send new trusted remotes list as soon as possible
+            self.last_request_tm = None;
+        }
         self.trusted_remotes.remove(&key);
     }
 
     pub fn set_trusted_remote_list(&mut self, new_trusted_remotes: Vec<PublicKey>) {
         // add new
         for trusted in &new_trusted_remotes {
-            self.trusted_remotes.entry(*trusted).or_default();
+            self.add_trusted_remote(*trusted)
         }
         // remove old
-        self.trusted_remotes.retain(|k, _| new_trusted_remotes.contains(k));
+        self.trusted_remotes.retain(|k, _| {
+            let should_keep = new_trusted_remotes.contains(k);
+            if !should_keep {
+                // reset last request tm to send new trusted remotes list as soon as possible
+                self.last_request_tm = None;
+            }
+            should_keep
+        });
     }
 
     /// Feedback method. Call this after connection returned by poll_accept failed or closed
     /// This will re-enable discovery for this peer
     pub fn on_connection_closed(&mut self, key: PublicKey) {
         self.trusted_remotes.entry(key).or_default().state_kind = PeerStateKind::Enabled;
+        // reset last request tm to send new trusted remotes list as soon as possible
+        self.last_request_tm = None;
     }
 
-    /// Take next <= 10 trusted remotes, moving offset in a circular buffer
+    /// Take up to 50 trusted remotes. If there are more than 50, pick exactly 50 at random.
     fn new_available_remotes_list(&mut self) -> Vec<PublicKey> {
-        let iter_forward = self.trusted_remotes.range(self.last_trusted_peer_offset..);
-        let iter_wrap = self.trusted_remotes.range(..self.last_trusted_peer_offset);
-
-        let result: Vec<PublicKey> = iter_forward.chain(iter_wrap)
+        let mut available: Vec<PublicKey> = self.trusted_remotes.iter()
             .filter(|(_, s)| s.is_discovery_enabled())
-            .take(10)
             .map(|(k, _)| *k)
             .collect();
 
-        if let Some(last_key) = result.last() {
-            let next_entry = self.trusted_remotes
-                .range((Bound::Excluded(*last_key), Bound::Unbounded))
-                .next();
-
-            self.last_trusted_peer_offset = match next_entry {
-                Some((k, _)) => *k,
-                None => {
-                    *self.trusted_remotes.keys().next().unwrap_or(last_key)
-                }
-            };
+        if available.len() > 50 {
+            available.shuffle(&mut rand::rng());
+            available.truncate(50);
         }
 
-        result
+        available
     }
     async fn place_connection_requests(&mut self, peer_pubkeys_list: Vec<PublicKey>) -> anyhow::Result<()> {
         let socket = &self.socket;
@@ -371,9 +378,16 @@ impl UdpConnectionEstablisher {
         }
 
         // 1) multicast discovery
-        if let Some(mut socket) = self.multicast_discovery_socket {
+        if let Some(socket) = self.multicast_discovery_socket.as_mut() {
             socket.poll(|msg| {
                 match msg {
+                    PollResult::DiscoveredClient {
+                        addr,
+                        discover_id,
+                        adv_data
+                    } => {
+
+                    }
                     PollResult::DisconnectedClient {
                         addr,
                         discover_id
@@ -432,6 +446,7 @@ impl UdpConnectionEstablisher {
                                     debug!("Got duplicate connection notification with same session_id, ignoring");
                                     return None;
                                 }
+                                state.last_error_same_ip = None;
                                 state.last_accepted_session_id = Some(remote_session_id);
 
                                 // New valid connection request received from p2p server, swapping sockets and setting up new session id
@@ -476,7 +491,14 @@ impl UdpConnectionEstablisher {
                         FromServerMessage::ErrorSameIp {
                             peer_pubkey
                         } => {
+                            if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
+                                if matches!(state.state_kind, PeerStateKind::ConnectionActive) {
+                                    state.last_error_same_ip = Some(Instant::now());
+                                    state.state_kind = PeerStateKind::DisabledUntil(Instant::now() + Duration::from_millis(SAME_IP_RETRY_TIMEOUT_MS));
+                                }
+                            }
 
+                            None
                         }
                     }
                 }

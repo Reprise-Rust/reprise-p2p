@@ -135,7 +135,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
 
                                         // if found incoming request from other peer
                                         if let Some(request) = pending_request {
-                                            // <- at this point we have matched requests and they are not present in state
+                                            // <- at this point we have matched requests and they are removed from state
                                             info!("[Reprise:UDP] Matched connection request: {:?} at {} <-> {:?} at {}", request.requester_pubkey, request.requester_addr, sender_pubkey, addr);
 
                                             let to_original = FromServerMessage::InitiateConnectionRequest {
@@ -166,6 +166,11 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                                 remote_peer: request.requester_pubkey,
                                                 remote_addr: request.requester_addr,
                                                 session_id: request.requester_session_id,
+                                            });
+                                            state.last_session_ids.insert(request.requester_pubkey, ActiveSession {
+                                                remote_peer: sender_pubkey,
+                                                remote_addr: addr,
+                                                session_id,
                                             });
                                         }
                                         else {
