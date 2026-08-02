@@ -12,7 +12,7 @@ use ed25519_dalek::SigningKey;
 use if_addrs::Interface;
 use log::{debug, error, info, warn};
 use multicast_discovery_socket::config::MulticastDiscoveryConfig;
-use multicast_discovery_socket::MulticastDiscoverySocket;
+use multicast_discovery_socket::{MulticastDiscoverySocket, PollResult};
 use quinn::{rustls, EndpointConfig, TransportConfig};
 use rand::random;
 use thiserror::Error;
@@ -91,7 +91,7 @@ pub struct UdpConnectionEstablisher {
     multicast_discovery_socket: Option<MulticastDiscoverySocket<DiscoveryPublicData>>,
 }
 
-const REQUEST_PLACEMENT_INTERVAL: u64 = 2;
+const REQUEST_PLACEMENT_INTERVAL: u64 = 1;
 
 /// A fully hole-punched, ready-to-use P2P connection.
 pub struct NewP2pConnection {
@@ -220,6 +220,7 @@ impl UdpConnectionEstablisher {
         self.trusted_remotes.entry(key).or_default().state_kind = PeerStateKind::Enabled;
     }
 
+    /// Take next <= 10 trusted remotes, moving offset in a circular buffer
     fn new_available_remotes_list(&mut self) -> Vec<PublicKey> {
         let iter_forward = self.trusted_remotes.range(self.last_trusted_peer_offset..);
         let iter_wrap = self.trusted_remotes.range(..self.last_trusted_peer_offset);
@@ -369,6 +370,21 @@ impl UdpConnectionEstablisher {
             self.cur_interface = cur_interface_name;
         }
 
+        // 1) multicast discovery
+        if let Some(mut socket) = self.multicast_discovery_socket {
+            socket.poll(|msg| {
+                match msg {
+                    PollResult::DisconnectedClient {
+                        addr,
+                        discover_id
+                    } => {
+
+                    }
+                }
+            })
+        }
+
+        // 2) server-assisted discovery
         if self.last_request_tm.is_none_or(|i| i.elapsed().as_secs() > REQUEST_PLACEMENT_INTERVAL) {
             let peer_pubkeys_list = self.new_available_remotes_list();
 
@@ -386,6 +402,10 @@ impl UdpConnectionEstablisher {
         let mut buf = vec![0; 2000];
         match timeout(dur, self.socket.recv_from(&mut buf)).await {
             Ok(Ok((sz, addr))) => {
+                // 1) try parse as local network connection request
+
+
+                // 2) parse as p2p server message
                 if addr != self.p2p_server_addr.into() {
                     warn!("Ignoring UDP packet not from p2p server");
                     return None;
@@ -424,7 +444,6 @@ impl UdpConnectionEstablisher {
                                         state.state_kind = PeerStateKind::DisabledUntil(Instant::now() + state.failure_retry_timeout);
                                         state.failure_retry_timeout += min(state.failure_retry_timeout, Duration::from_secs(1));
                                         state.failure_retry_timeout = state.failure_retry_timeout.min(Duration::from_millis(HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS));
-                                        self.last_request_tm = None; // retry immediately on next poll
                                         return Some(Err(anyhow!(e).context(context)));
                                     }
                                 };
@@ -445,13 +464,19 @@ impl UdpConnectionEstablisher {
                                 Some(Err(anyhow::anyhow!("Peer pubkey not in trusted list")))
                             }
                         }
-                        FromServerMessage::LostConnectionRequest {
-                            peer_address,
+                        FromServerMessage::NeedNewSession {
+                            old_session_id
+                        } => {
+                            if self.session_id == old_session_id {
+                                self.session_id = random();
+                                warn!("Got lost request, starting new session...");
+                            }
+                            None
+                        }
+                        FromServerMessage::ErrorSameIp {
                             peer_pubkey
                         } => {
-                            self.session_id = random();
-                            warn!("Got lost connection notification from {}, new session id assigned", peer_address);
-                            None
+
                         }
                     }
                 }

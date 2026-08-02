@@ -11,16 +11,18 @@ use tokio::select;
 const REQUEST_TIMEOUT_S: u64 = 10;
 const SIGNED_MSG_VALID_S: i64 = 30;
 
-struct PendingRequest {
+#[derive(Clone)]
+struct RequestInfo {
     requester_pubkey: PublicKey,
     requester_addr: SocketAddrV4,
     requester_session_id: u32,
+    trusted_remotes: Vec<PublicKey>,
     tm: Instant,
 }
 
 struct UdpState {
     /// Map from (requester_pubkey, target_pubkey) to the pending request info.
-    requests: HashMap<PublicKey, HashMap<PublicKey, PendingRequest>>,
+    requests: HashMap<PublicKey, RequestInfo>,
     last_session_ids: HashMap<PublicKey, ActiveSession>,
 }
 struct ActiveSession {
@@ -38,9 +40,8 @@ impl UdpState {
     }
 
     fn cleanup(&mut self) {
-        self.requests.retain(|_sender_pubkey, inner_map| {
-            inner_map.retain(|_peer_pubkey, v| v.tm.elapsed().as_secs() < REQUEST_TIMEOUT_S);
-            !inner_map.is_empty()
+        self.requests.retain(|_sender_pubkey, info| {
+            info.tm.elapsed().as_secs() <= REQUEST_TIMEOUT_S && !info.trusted_remotes.is_empty()
         });
     }
 }
@@ -84,9 +85,8 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                         state.cleanup();
 
                                         if let Some(active_session) = state.last_session_ids.get(&sender_pubkey) && active_session.session_id == session_id {
-                                            let lost_request_bytes = FromServerMessage::LostConnectionRequest {
-                                                peer_address: active_session.remote_addr,
-                                                peer_pubkey: active_session.remote_peer,
+                                            let lost_request_bytes = FromServerMessage::NeedNewSession {
+                                                old_session_id: session_id,
                                             }.to_bytes();
                                             if let Err(e) = socket.send_to(&lost_request_bytes, addr).await {
                                                 warn!("[Reprise:UDP] Failed to send lost request notification to {}: {}", addr, e);
@@ -97,20 +97,46 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                         let mut pending_request = None;
 
                                         for peer_pubkey in &peer_pubkeys {
-                                            if let Some(inner_map) = state.requests.get_mut(peer_pubkey) {
-                                                pending_request = inner_map.remove(&sender_pubkey).map(|req| (peer_pubkey, req))
-                                            }
-                                            if pending_request.is_some() {
+                                            if state.requests.get_mut(peer_pubkey).is_some_and(|r| {
+                                                r.trusted_remotes.iter().any(|k| k == &sender_pubkey)
+                                            }) {
+                                                let peer_addr = state.requests.get(peer_pubkey).as_ref().unwrap().requester_addr;
+                                                if peer_addr == addr {
+                                                    let to_original = FromServerMessage::ErrorSameIp {
+                                                        peer_pubkey: sender_pubkey,
+                                                    };
+
+                                                    let to_new = FromServerMessage::ErrorSameIp {
+                                                        peer_pubkey: peer_pubkey.clone(),
+                                                    };
+
+                                                    let to_original_bytes = to_original.to_bytes();
+                                                    let to_new_bytes = to_new.to_bytes();
+
+                                                    if let Err(e) = socket.send_to(&to_original_bytes, peer_addr).await {
+                                                        warn!("[Reprise:UDP] Failed to send to original requester {}: {}", peer_addr, e);
+                                                    }
+                                                    if let Err(e) = socket.send_to(&to_new_bytes, addr).await {
+                                                        warn!("[Reprise:UDP] Failed to send to new requester {}: {}", addr, e);
+                                                    }
+
+                                                    continue
+                                                }
+
+                                                // found matching incoming request, remove it
+                                                let req = state.requests.remove(peer_pubkey).unwrap();
+                                                pending_request = Some(req);
+
+                                                // remove old our request if have one (matching new packet to remote state, not state to state)
+                                                state.requests.remove(&sender_pubkey);
                                                 break;
                                             }
                                         }
 
-                                        if let Some((peer_pubkey, pending)) = pending_request {
-                                            if let Some(true) = state.requests.get(peer_pubkey).map(|inner| inner.is_empty()) {
-                                                state.requests.remove(peer_pubkey);
-                                            }
-
-                                            info!("[Reprise:UDP] Matched connection request: {:?} at {} <-> {:?} at {}", pending.requester_pubkey, pending.requester_addr, sender_pubkey, addr);
+                                        // if found incoming request from other peer
+                                        if let Some(request) = pending_request {
+                                            // <- at this point we have matched requests and they are not present in state
+                                            info!("[Reprise:UDP] Matched connection request: {:?} at {} <-> {:?} at {}", request.requester_pubkey, request.requester_addr, sender_pubkey, addr);
 
                                             let to_original = FromServerMessage::InitiateConnectionRequest {
                                                 peer_pubkey: sender_pubkey,
@@ -120,40 +146,37 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                             };
 
                                             let to_new = FromServerMessage::InitiateConnectionRequest {
-                                                peer_pubkey: pending.requester_pubkey,
-                                                peer_address: pending.requester_addr,
-                                                remote_session_id: pending.requester_session_id,
+                                                peer_pubkey: request.requester_pubkey,
+                                                peer_address: request.requester_addr,
+                                                remote_session_id: request.requester_session_id,
                                                 is_listener: true
                                             };
 
                                             let to_original_bytes = to_original.to_bytes();
                                             let to_new_bytes = to_new.to_bytes();
 
-                                            if let Err(e) = socket.send_to(&to_original_bytes, pending.requester_addr).await {
-                                                warn!("[Reprise:UDP] Failed to send to original requester {}: {}", pending.requester_addr, e);
+                                            if let Err(e) = socket.send_to(&to_original_bytes, request.requester_addr).await {
+                                                warn!("[Reprise:UDP] Failed to send to original requester {}: {}", request.requester_addr, e);
                                             }
                                             if let Err(e) = socket.send_to(&to_new_bytes, addr).await {
                                                 warn!("[Reprise:UDP] Failed to send to new requester {}: {}", addr, e);
                                             }
 
                                             state.last_session_ids.insert(sender_pubkey, ActiveSession {
-                                                session_id: pending.requester_session_id,
-                                                remote_addr: pending.requester_addr,
-                                                remote_peer: pending.requester_pubkey
+                                                remote_peer: request.requester_pubkey,
+                                                remote_addr: request.requester_addr,
+                                                session_id: request.requester_session_id,
                                             });
-
-                                            state.requests.remove(&sender_pubkey);
                                         }
                                         else {
                                             state.requests.insert(sender_pubkey,
-                                                HashMap::from_iter(peer_pubkeys.into_iter().map(|peer_pubkey| {
-                                                    (peer_pubkey, PendingRequest {
-                                                        requester_pubkey: sender_pubkey,
-                                                        requester_addr: addr,
-                                                        requester_session_id: session_id,
-                                                        tm: Instant::now(),
-                                                    })
-                                                }))
+                                                RequestInfo {
+                                                    requester_pubkey: sender_pubkey,
+                                                    requester_addr: addr,
+                                                    requester_session_id: session_id,
+                                                    trusted_remotes: peer_pubkeys,
+                                                    tm: Instant::now(),
+                                                }
                                             );
                                         }
                                     }

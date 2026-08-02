@@ -1,0 +1,2 @@
+- bad rotation algorithm: if two clients have many trusted peers, they may rotate slices and never find each other
+- we can place requests for connection not so frequent (client should know when their request reached server)

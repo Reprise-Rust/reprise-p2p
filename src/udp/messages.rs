@@ -106,7 +106,7 @@ impl ToServerRawMessage {
 
 pub enum ToServerSignedMessage {
     /// Place temporary connection slot to the server. Connection will be established on matching connection request from other peer, included in list. All previous requests are invalidated on receiving this message
-    /// Maximum: 10 connection requests
+    /// Maximum: 50 connection requests
     ConnectionRequest {
         peer_pubkeys: Vec<PublicKey>,
         session_id: u32
@@ -149,7 +149,7 @@ impl ToServerSignedMessage {
                         let payload = &payload[4..];
 
                         let peer_pubkeys_len = payload[0] as usize;
-                        if peer_pubkeys_len > 10 || peer_pubkeys_len == 0{
+                        if peer_pubkeys_len > 50 || peer_pubkeys_len == 0{
                             return Err(ParseError::InvalidContentFormat);
                         }
                         let mut payload = &payload[1..];
@@ -187,8 +187,8 @@ impl ToServerSignedMessage {
                 session_id,
                 peer_pubkeys
             } => {
-                if peer_pubkeys.len() > 10 || peer_pubkeys.is_empty() {
-                    panic!("Cannot encode ConnectionRequest! Maximum 10 peer public keys allowed per message!");
+                if peer_pubkeys.len() > 50 || peer_pubkeys.is_empty() {
+                    panic!("Cannot encode ConnectionRequest! Maximum 50 peer public keys allowed per message!");
                 }
 
                 let mut payload = Vec::new();
@@ -228,9 +228,11 @@ pub enum FromServerMessage {
         is_listener: bool,
     },
     /// Notification about lost connection request, meaning we should regenerate new session id
-    LostConnectionRequest {
+    NeedNewSession {
+        old_session_id: u32,
+    },
+    ErrorSameIp {
         peer_pubkey: PublicKey,
-        peer_address: SocketAddrV4,
     }
 }
 
@@ -268,20 +270,25 @@ impl FromServerMessage {
                 }
             }
             2 => {
-                if bytes.len() < 32 + 4 + 2 {
+                if bytes.len() < 4 {
                     return Err(ParseError::TooShort);
                 }
 
-                let pubkey = bytes[..32].try_into().unwrap();
-                let bytes = &bytes[32..];
+                let old_session_id = u32::from_le_bytes(bytes[..4].try_into().unwrap());
 
-                let ip_addr = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
-                let port = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-                let addr = SocketAddrV4::new(ip_addr, port);
+                Self::NeedNewSession {
+                    old_session_id
+                }
+            }
+            3 => {
+                if bytes.len() < 32 {
+                    return Err(ParseError::TooShort);
+                }
 
-                Self::LostConnectionRequest {
-                    peer_pubkey: pubkey,
-                    peer_address: addr,
+                let peer_pubkey = bytes[..32].try_into().unwrap();
+
+                Self::ErrorSameIp {
+                    peer_pubkey
                 }
             }
             _ => {
@@ -305,13 +312,19 @@ impl FromServerMessage {
 
                 payload
             }
-            Self::LostConnectionRequest { peer_pubkey, peer_address } => {
+            Self::NeedNewSession {old_session_id} => {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&[2]);
 
+                payload.extend_from_slice(&old_session_id.to_le_bytes());
+
+                payload
+            }
+            Self::ErrorSameIp {peer_pubkey} => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&[3]);
+
                 payload.extend_from_slice(peer_pubkey);
-                payload.extend_from_slice(&peer_address.ip().octets());
-                payload.extend_from_slice(&peer_address.port().to_le_bytes());
 
                 payload
             }
