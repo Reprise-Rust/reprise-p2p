@@ -20,6 +20,7 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use crate::p2p_interface_tracker::P2pInterfaceTracker;
+use crate::udp::client::peer_state::PeerState;
 use crate::udp::messages;
 use crate::udp::messages::{FromServerMessage, PublicKey};
 use crate::udp::quic;
@@ -34,33 +35,78 @@ enum PeerStateKind {
     DisabledUntil(Instant),
 }
 
-struct PeerState {
-    /// Whether we're actively trying to connect to this peer.
-    state_kind: PeerStateKind,
-    failure_retry_timeout: Duration,
-    /// The last `remote_session_id` we accepted from the server for this peer.
-    /// Used to ignore duplicate notifications.
-    last_accepted_session_id: Option<u32>,
-    last_error_same_ip: Option<Instant>,
-}
+mod peer_state {
+    use std::cmp::min;
+    use std::time::{Duration, Instant};
+    use crate::udp::client::{PeerStateKind, HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS, HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS, SAME_IP_RETRY_TIMEOUT_MS};
 
-impl PeerState {
-    fn is_discovery_enabled(&self) -> bool {
-        match self.state_kind {
-            PeerStateKind::ConnectionActive => false,
-            PeerStateKind::DisabledUntil(i) => i < Instant::now(),
-            PeerStateKind::Enabled => true,
+    pub struct PeerState {
+        /// Whether we're actively trying to connect to this peer.
+        state_kind: PeerStateKind,
+        failure_retry_timeout: Duration,
+        /// The last `remote_session_id` we accepted from the server for this peer.
+        /// Used to ignore duplicate notifications.
+        last_accepted_session_id: Option<u32>,
+        last_error_same_ip: Option<Instant>,
+    }
+
+
+    impl PeerState {
+        pub fn is_discovery_enabled(&self) -> bool {
+            match self.state_kind {
+                PeerStateKind::ConnectionActive => false,
+                PeerStateKind::DisabledUntil(i) => i < Instant::now(),
+                PeerStateKind::Enabled => true,
+            }
+        }
+
+        /// Can only be called after creation or on_hole_punch_err/resume_discovery/on_new_connection_request
+        /// when got new request from p2p server. Next call: on_hole_punch_err or on_connection_established 
+        /// Returns false if session id is invalid (matches previous session id for client)
+        pub fn on_new_connection_request(&mut self, remote_session_id: u32) -> bool {
+            if self.last_accepted_session_id == Some(remote_session_id) {
+                return false
+            }
+            self.last_error_same_ip = None;
+            self.last_accepted_session_id = Some(remote_session_id);
+            true
+        }
+
+        /// Can only be called after on_new_connection_request
+        pub fn on_hole_punch_err(&mut self) {
+            self.state_kind = PeerStateKind::DisabledUntil(Instant::now() + self.failure_retry_timeout);
+            self.failure_retry_timeout += min(self.failure_retry_timeout, Duration::from_secs(1));
+            self.failure_retry_timeout = self.failure_retry_timeout.min(Duration::from_millis(HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS));
+        }
+
+        /// Can only be called after on_new_connection_request
+        pub fn on_connection_established(&mut self) {
+            self.state_kind = PeerStateKind::ConnectionActive;
+            self.failure_retry_timeout = Duration::from_millis(HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS);
+        }
+        
+        
+        /// Can only be called after on_connection_established
+        pub fn resume_discovery(&mut self) {
+            self.state_kind = PeerStateKind::Enabled;
+        }
+
+        pub fn on_error_same_ip(&mut self) {
+            if matches!(self.state_kind, PeerStateKind::ConnectionActive) {
+                self.last_error_same_ip = Some(Instant::now());
+                self.state_kind = PeerStateKind::DisabledUntil(Instant::now() + Duration::from_millis(SAME_IP_RETRY_TIMEOUT_MS));
+            }
         }
     }
-}
 
-impl Default for PeerState {
-    fn default() -> Self {
-        Self {
-            state_kind: PeerStateKind::Enabled,
-            failure_retry_timeout: Duration::from_millis(HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS),
-            last_accepted_session_id: None,
-            last_error_same_ip: None
+    impl Default for PeerState {
+        fn default() -> Self {
+            Self {
+                state_kind: PeerStateKind::Enabled,
+                failure_retry_timeout: Duration::from_millis(HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS),
+                last_accepted_session_id: None,
+                last_error_same_ip: None
+            }
         }
     }
 }
@@ -234,7 +280,7 @@ impl UdpConnectionEstablisher {
     /// Feedback method. Call this after connection returned by poll_accept failed or closed
     /// This will re-enable discovery for this peer
     pub fn on_connection_closed(&mut self, key: PublicKey) {
-        self.trusted_remotes.entry(key).or_default().state_kind = PeerStateKind::Enabled;
+        self.trusted_remotes.entry(key).or_default().resume_discovery();
         // reset last request tm to send new trusted remotes list as soon as possible
         self.last_request_tm = None;
     }
@@ -442,12 +488,10 @@ impl UdpConnectionEstablisher {
                                     return None;
                                 }
 
-                                if state.last_accepted_session_id == Some(remote_session_id) {
+                                if !state.on_new_connection_request(remote_session_id) {
                                     debug!("Got duplicate connection notification with same session_id, ignoring");
                                     return None;
                                 }
-                                state.last_error_same_ip = None;
-                                state.last_accepted_session_id = Some(remote_session_id);
 
                                 // New valid connection request received from p2p server, swapping sockets and setting up new session id
                                 let socket = mem::replace(&mut self.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
@@ -456,16 +500,13 @@ impl UdpConnectionEstablisher {
                                 let actual_peer_addr = match Self::hole_punch(&socket, peer_address).await {
                                     Ok(addr) => addr,
                                     Err(e) => {
-                                        state.state_kind = PeerStateKind::DisabledUntil(Instant::now() + state.failure_retry_timeout);
-                                        state.failure_retry_timeout += min(state.failure_retry_timeout, Duration::from_secs(1));
-                                        state.failure_retry_timeout = state.failure_retry_timeout.min(Duration::from_millis(HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS));
+                                        state.on_hole_punch_err();
                                         return Some(Err(anyhow!(e).context(context)));
                                     }
                                 };
 
                                 // mark connection as connected (or connection in progress)
-                                state.state_kind = PeerStateKind::ConnectionActive;
-                                state.failure_retry_timeout = Duration::from_millis(HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS);
+                                state.on_connection_established();
                                 self.last_request_tm = None; // retry immediately on next poll
                                 Some(Ok(NewP2pConnection {
                                     pubkey: peer_pubkey,
@@ -492,10 +533,7 @@ impl UdpConnectionEstablisher {
                             peer_pubkey
                         } => {
                             if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
-                                if matches!(state.state_kind, PeerStateKind::ConnectionActive) {
-                                    state.last_error_same_ip = Some(Instant::now());
-                                    state.state_kind = PeerStateKind::DisabledUntil(Instant::now() + Duration::from_millis(SAME_IP_RETRY_TIMEOUT_MS));
-                                }
+                                state.on_error_same_ip();
                             }
 
                             None

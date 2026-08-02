@@ -42,7 +42,7 @@ async fn main() {
     };
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
-    let mut client = UdpConnectionEstablisher::new(signing_key, server_addr).await;
+    let mut client = UdpConnectionEstablisher::new(signing_key, server_addr, None).await;
     client.add_trusted_remote(peer_key);
     println!("Initialized, waiting for connection...");
 
