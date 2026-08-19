@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::cmp::min;
 use std::collections::{BTreeMap, Bound};
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
@@ -28,6 +27,7 @@ use crate::udp::quic;
 const HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS: u64 = 100;
 const HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS: u64 = 5_000;
 const SAME_IP_RETRY_TIMEOUT_MS: u64 = 5_000;
+const LOCAL_DISCOVERY_DURATION_SECS: u64 = 10;
 
 enum PeerStateKind {
     ConnectionActive,
@@ -38,7 +38,7 @@ enum PeerStateKind {
 mod peer_state {
     use std::cmp::min;
     use std::time::{Duration, Instant};
-    use crate::udp::client::{PeerStateKind, HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS, HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS, SAME_IP_RETRY_TIMEOUT_MS};
+    use crate::udp::client::{PeerStateKind, HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS, HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS, SAME_IP_RETRY_TIMEOUT_MS, LOCAL_DISCOVERY_DURATION_SECS};
 
     pub struct PeerState {
         /// Whether we're actively trying to connect to this peer.
@@ -53,7 +53,7 @@ mod peer_state {
 
     impl PeerState {
         pub fn is_discovery_enabled(&self) -> bool {
-            match self.state_kind {
+            !self.is_local_discovery_enabled() && match self.state_kind {
                 PeerStateKind::ConnectionActive => false,
                 PeerStateKind::DisabledUntil(i) => i < Instant::now(),
                 PeerStateKind::Enabled => true,
@@ -96,6 +96,10 @@ mod peer_state {
                 self.last_error_same_ip = Some(Instant::now());
                 self.state_kind = PeerStateKind::DisabledUntil(Instant::now() + Duration::from_millis(SAME_IP_RETRY_TIMEOUT_MS));
             }
+        }
+
+        pub fn is_local_discovery_enabled(&self) -> bool {
+            self.last_error_same_ip.is_some_and(|t| t.elapsed() < Duration::from_secs(LOCAL_DISCOVERY_DURATION_SECS))
         }
     }
 
@@ -415,6 +419,8 @@ impl UdpConnectionEstablisher {
     /// Block for `dur`, returning a new hole-punched connection or an error.
     /// The returned connection has already completed the full hole punch handshake
     /// and is ready for immediate send/recv use.
+    ///
+    /// In case of error or no clients to accept, block for 100ms
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<anyhow::Result<NewP2pConnection>> {
         let cur_interface = self.p2p_interface_tracker.current_interface();
         let cur_interface_name = cur_interface.as_ref().map(|i| i.name.clone());
@@ -484,6 +490,7 @@ impl UdpConnectionEstablisher {
                             let context = format!("Handling InitiateConnectionRequest from p2p server for peer {}, session_id={}", peer_address, remote_session_id);
                             if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
                                 if !state.is_discovery_enabled() {
+                                    // According to local state, we are already connected to this client.
                                     debug!("Got duplicate connection notification, ignoring");
                                     return None;
                                 }
