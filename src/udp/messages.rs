@@ -28,19 +28,24 @@ pub enum ParseError {
     InvalidSignature,
 }
 
-enum ToServerRawMessage {
+pub struct SignedMessage {
+    pubkey: PublicKey,
+    timestamp: DateTime<Utc>,
+    payload: Vec<u8>,
+    signature: Signature,
+}
+
+pub enum ToServerRawMessage {
     /// Signed message generated at `timestamp`, valid for 10 seconds after generation timestamp.
     /// The signature is formed for (timestamp | payload) message
-    SignedMessage {
-        pubkey: PublicKey,
-        timestamp: DateTime<Utc>,
-        payload: Vec<u8>,
-        signature: Signature,
+    SignedMessage(SignedMessage),
+    Ping {
+        payload: u64
     }
 }
 
 impl ToServerRawMessage {
-    fn try_parse(bytes: &[u8]) -> Result<ToServerRawMessage, ParseError> {
+    pub fn try_parse(bytes: &[u8]) -> Result<ToServerRawMessage, ParseError> {
         if bytes.len() < 3 {
             return Err(ParseError::TooShort);
         }
@@ -70,33 +75,51 @@ impl ToServerRawMessage {
                 let pubkey = bytes[..32].try_into().unwrap();
                 let payload = bytes[32..].to_vec();
 
-                Ok(ToServerRawMessage::SignedMessage {
+                Ok(ToServerRawMessage::SignedMessage (SignedMessage {
                     timestamp,
                     pubkey,
                     signature,
                     payload
-                })
+                }))
             },
+            2 => { // Ping
+                if bytes.len() < 8 {
+                    return Err(ParseError::TooShort);
+                }
+
+                let payload = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                Ok(ToServerRawMessage::Ping {
+                    payload
+                })
+            }
             _ => {
                 Err(ParseError::InvalidMessageId(msg_id))
             }
         }
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut res = vec![];
         match self {
-            Self::SignedMessage {
+            Self::SignedMessage (SignedMessage{
                 payload,
                 timestamp,
                 signature,
                 pubkey
-            } => {
+            }) => {
                 res.extend_from_slice(&[1, PROTOCOL_VERSION]);
                 res.extend_from_slice(&timestamp.timestamp_millis().to_le_bytes());
                 res.extend_from_slice(signature);
                 res.extend_from_slice(pubkey);
                 res.extend_from_slice(payload);
+
+                res
+            }
+            Self::Ping {
+                payload
+            } => {
+                res.extend_from_slice(&[2, PROTOCOL_VERSION]);
+                res.extend_from_slice(&payload.to_le_bytes());
 
                 res
             }
@@ -110,74 +133,70 @@ pub enum ToServerSignedMessage {
     ConnectionRequest {
         peer_pubkeys: Vec<PublicKey>,
         session_id: u32
-    }
+    },
 }
 
 impl ToServerSignedMessage {
     /// Input: raw bytes of incoming UDP datagram
-    pub fn try_parse(bytes: &[u8]) -> Result<(ToServerSignedMessage, PublicKey, DateTime<Utc>), ParseError> {
-        let raw_msg = ToServerRawMessage::try_parse(&bytes)?;
+    pub fn try_parse(raw_msg: SignedMessage) -> Result<(ToServerSignedMessage, PublicKey, DateTime<Utc>), ParseError> {
+        let SignedMessage {
+            pubkey,
+            timestamp,
+            payload,
+            signature
+        } = raw_msg;
 
-        match raw_msg {
-            ToServerRawMessage::SignedMessage {
-                pubkey,
-                timestamp,
-                payload,
-                signature
-            } => {
-                let verifying_key = VerifyingKey::from_bytes(&pubkey).map_err(|_| ParseError::InvalidContentFormat)?;
+        let verifying_key = VerifyingKey::from_bytes(&pubkey).map_err(|_| ParseError::InvalidContentFormat)?;
 
-                let mut msg = timestamp.timestamp_millis().to_le_bytes().to_vec();
-                msg.extend_from_slice(&payload);
+        let mut msg = timestamp.timestamp_millis().to_le_bytes().to_vec();
+        msg.extend_from_slice(&payload);
 
-                verifying_key.verify(&msg, &ed25519::Signature::from_bytes(&signature)).map_err(|_| ParseError::InvalidSignature)?;
-                // After verification, parse message
+        verifying_key.verify(&msg, &ed25519::Signature::from_bytes(&signature)).map_err(|_| ParseError::InvalidSignature)?;
+        // After verification, parse message
 
-                if payload.len() == 0 {
-                    return Err(ParseError::TooShort);
+        if payload.len() == 0 {
+            return Err(ParseError::TooShort);
+        }
+
+        let msg_id = payload[0];
+        let payload = &payload[1..];
+        let msg = match msg_id {
+            1 => {
+                if payload.len() < 4 + 1 {
+                    return Err(ParseError::InvalidContentFormat);
                 }
 
-                let msg_id = payload[0];
-                let payload = &payload[1..];
-                let msg = match msg_id {
-                    1 => {
-                        if payload.len() < 4 + 1 {
-                            return Err(ParseError::InvalidContentFormat);
-                        }
+                let session_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                let payload = &payload[4..];
 
-                        let session_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
-                        let payload = &payload[4..];
+                let peer_pubkeys_len = payload[0] as usize;
+                if peer_pubkeys_len > 50 || peer_pubkeys_len == 0{
+                    return Err(ParseError::InvalidContentFormat);
+                }
+                let mut payload = &payload[1..];
 
-                        let peer_pubkeys_len = payload[0] as usize;
-                        if peer_pubkeys_len > 50 || peer_pubkeys_len == 0{
-                            return Err(ParseError::InvalidContentFormat);
-                        }
-                        let mut payload = &payload[1..];
+                if payload.len() < 32 * peer_pubkeys_len {
+                    return Err(ParseError::InvalidContentFormat);
+                }
 
-                        if payload.len() < 32 * peer_pubkeys_len {
-                            return Err(ParseError::InvalidContentFormat);
-                        }
+                let mut peer_pubkeys = Vec::with_capacity(peer_pubkeys_len);
+                for _ in 0..peer_pubkeys_len {
+                    let peer_pubkey = payload[..32].try_into().unwrap();
+                    peer_pubkeys.push(peer_pubkey);
+                    payload = &payload[32..];
+                }
 
-                        let mut peer_pubkeys = Vec::with_capacity(peer_pubkeys_len);
-                        for _ in 0..peer_pubkeys_len {
-                            let peer_pubkey = payload[..32].try_into().unwrap();
-                            peer_pubkeys.push(peer_pubkey);
-                            payload = &payload[32..];
-                        }
-
-                        Self::ConnectionRequest {
-                            session_id,
-                            peer_pubkeys,
-                        }
-                    }
-                    _ => {
-                        return Err(ParseError::InvalidMessageId(msg_id));
-                    }
-                };
-
-                Ok((msg, pubkey, timestamp))
+                Self::ConnectionRequest {
+                    session_id,
+                    peer_pubkeys,
+                }
             }
-        }
+            _ => {
+                return Err(ParseError::InvalidMessageId(msg_id));
+            }
+        };
+
+        Ok((msg, pubkey, timestamp))
     }
 
     /// Output: raw bytes of outgoing UDP datagram
@@ -207,12 +226,12 @@ impl ToServerSignedMessage {
                 let signature = key.sign(&msg).to_bytes();
 
                 let our_pubkey = key.verifying_key().to_bytes();
-                let res = ToServerRawMessage::SignedMessage {
+                let res = ToServerRawMessage::SignedMessage (SignedMessage {
                     pubkey: our_pubkey,
                     payload,
                     signature,
                     timestamp,
-                };
+                });
 
                 res.to_bytes()
             }
@@ -233,6 +252,9 @@ pub enum FromServerMessage {
     },
     ErrorSameIp {
         peer_pubkey: PublicKey,
+    },
+    Pong {
+        payload: u64,
     }
 }
 
@@ -327,6 +349,16 @@ impl FromServerMessage {
                 payload.extend_from_slice(peer_pubkey);
 
                 payload
+            }
+            Self::Pong {
+                payload
+            } => {
+                let mut payload_msg = Vec::new();
+                payload_msg.extend_from_slice(&[4]);
+
+                payload_msg.extend_from_slice(payload.to_le_bytes().as_ref());
+
+                payload_msg
             }
         }
     }

@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use crate::p2p_interface_tracker::P2pInterfaceTracker;
 use crate::udp::client::peer_state::PeerState;
 use crate::udp::messages;
-use crate::udp::messages::{FromServerMessage, PublicKey};
+use crate::udp::messages::{FromServerMessage, PublicKey, ToServerRawMessage};
 use crate::udp::quic;
 
 const HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS: u64 = 100;
@@ -41,8 +41,9 @@ mod peer_state {
     use crate::udp::client::{PeerStateKind, HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS, HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS, SAME_IP_RETRY_TIMEOUT_MS, LOCAL_DISCOVERY_DURATION_SECS};
 
     pub struct PeerState {
-        /// Whether we're actively trying to connect to this peer.
+        /// Logical connection state for this peer
         state_kind: PeerStateKind,
+
         failure_retry_timeout: Duration,
         /// The last `remote_session_id` we accepted from the server for this peer.
         /// Used to ignore duplicate notifications.
@@ -142,6 +143,9 @@ pub struct UdpConnectionEstablisher {
     p2p_interface_tracker: P2pInterfaceTracker,
     cur_interface: Option<String>,
     multicast_discovery_socket: Option<MulticastDiscoverySocket<DiscoveryPublicData>>,
+    last_p2p_server_ping_send_tm: Option<Instant>,
+    last_p2p_server_ping: Option<(Instant, u64)>,
+    last_p2p_server_pong: Option<Instant>,
 }
 
 const REQUEST_PLACEMENT_INTERVAL: u64 = 1;
@@ -245,6 +249,9 @@ impl UdpConnectionEstablisher {
             cur_interface: p2p_interface_tracker.current_interface().map(|i| i.name),
             p2p_interface_tracker,
             multicast_discovery_socket,
+            last_p2p_server_ping_send_tm: None,
+            last_p2p_server_ping: None,
+            last_p2p_server_pong: None,
         }
     }
 
@@ -450,7 +457,19 @@ impl UdpConnectionEstablisher {
             })
         }
 
-        // 2) server-assisted discovery
+        // 2.1) server-assisted discovery, server ping
+        if self.last_p2p_server_ping_send_tm.is_none_or(|i| i.elapsed().as_secs() > 3) {
+            self.last_p2p_server_ping_send_tm = Some(Instant::now());
+            let ping_packet = ToServerRawMessage::Ping {
+                payload: random(),
+            };
+
+            let res = self.socket.send_to(&ping_packet.to_bytes(), self.p2p_server_addr).await;
+            if let Err(e) = res {
+                warn!("Failed to send ping to p2p discovery server: {:?}", e);
+            }
+        }
+        // 2.2) server-assisted discovery, send requests
         if self.last_request_tm.is_none_or(|i| i.elapsed().as_secs() > REQUEST_PLACEMENT_INTERVAL) {
             let peer_pubkeys_list = self.new_available_remotes_list();
 
@@ -545,6 +564,17 @@ impl UdpConnectionEstablisher {
 
                             None
                         }
+                        FromServerMessage::Pong {
+                            payload
+                        } => {
+                            if self.last_p2p_server_ping.is_none_or(|(tm, last_payload)| {
+                                last_payload == payload && tm.elapsed().as_secs() < 10
+                            }) {
+                                self.last_p2p_server_pong = Some(Instant::now());
+                            }
+
+                            None
+                        }
                     }
                 }
                 else {
@@ -567,7 +597,7 @@ impl UdpConnectionEstablisher {
 // If Some => your system time is off by `value` hours from real time
 pub async fn check_system_time_error() -> Option<f32> {
     let system_time = Utc::now();
-    match tokio::time::timeout(Duration::from_secs(1), reqwest::get(format!("https://timeapi.io/api/v1/time/current/unix"))).await {
+    match tokio::time::timeout(Duration::from_secs(1), reqwest::get("https://timeapi.io/api/v1/time/current/unix".to_string())).await {
         Err(_) => {
             // cannot connect to timeapi.io
         }
