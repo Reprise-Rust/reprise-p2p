@@ -1,6 +1,8 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{ed25519, Signer, SigningKey, Verifier, VerifyingKey};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use thiserror::Error;
 
 pub type PublicKey = [u8; 32];
@@ -362,4 +364,17 @@ impl FromServerMessage {
             }
         }
     }
+}
+
+type HmacSha256 = Hmac<Sha256>;
+pub fn transform_discovery_data(pubkey: [u8; 32], obfuscation_key: String) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(obfuscation_key.as_bytes())
+        .expect("HMAC can take key of any size");
+
+    mac.update(&pubkey);
+    let result = mac.finalize().into_bytes();
+
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&result);
+    output
 }

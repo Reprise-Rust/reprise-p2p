@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use crate::p2p_interface_tracker::P2pInterfaceTracker;
 use crate::udp::client::peer_state::PeerState;
 use crate::udp::messages;
-use crate::udp::messages::{FromServerMessage, PublicKey, ToServerRawMessage};
+use crate::udp::messages::{transform_discovery_data, FromServerMessage, PublicKey, ToServerRawMessage};
 use crate::udp::quic;
 
 const HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS: u64 = 100;
@@ -116,23 +116,6 @@ mod peer_state {
     }
 }
 
-#[derive(Clone, bincode::Encode, bincode::Decode)]
-pub struct DiscoveryPublicData {
-    buf: Vec<u8>,
-    pubkey: PublicKey,
-    discovery_obs_key: String
-}
-
-impl DiscoveryPublicData {
-    pub fn from_obf_key(pubkey: PublicKey, discovery_obs_key: String) -> Self {
-        Self {
-            pubkey,
-            discovery_obs_key,
-            buf: Vec::new(),
-        }
-    }
-}
-
 pub struct UdpConnectionEstablisher {
     p2p_server_addr: SocketAddrV4,
     trusted_remotes: BTreeMap<PublicKey, PeerState>,
@@ -142,7 +125,7 @@ pub struct UdpConnectionEstablisher {
     socket: UdpSocket,
     p2p_interface_tracker: P2pInterfaceTracker,
     cur_interface: Option<String>,
-    multicast_discovery_socket: Option<MulticastDiscoverySocket<DiscoveryPublicData>>,
+    multicast_discovery_socket: Option<MulticastDiscoverySocket<[u8; 32]>>,
     last_p2p_server_ping_send_tm: Option<Instant>,
     last_p2p_server_ping: Option<(Instant, u64)>,
     last_p2p_server_pong: Option<Instant>,
@@ -235,7 +218,7 @@ impl UdpConnectionEstablisher {
             MulticastDiscoverySocket::new_with_service(
                     multicast_discovery_config,
                     local_discovery_config.port,
-                    DiscoveryPublicData::from_obf_key(key.to_scalar_bytes(), local_discovery_config.obfuscation_key, )).unwrap()
+                    transform_discovery_data(key.to_scalar_bytes(), local_discovery_config.obfuscation_key)).unwrap()
         });
 
         let mut p2p_interface_tracker = P2pInterfaceTracker::new();
