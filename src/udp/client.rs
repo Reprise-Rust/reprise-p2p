@@ -26,8 +26,8 @@ use crate::udp::quic;
 
 const HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS: u64 = 100;
 const HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS: u64 = 5_000;
-const SAME_IP_RETRY_TIMEOUT_MS: u64 = 5_000;
-const LOCAL_DISCOVERY_DURATION_SECS: u64 = 10;
+const LOCAL_DISCOVERY_DURATION_SECS: u64 = 6;
+const LOCAL_DISCOVERY_ENABLE_DELAY_SECS: u64 = 3;
 
 enum PeerStateKind {
     ConnectionActive,
@@ -38,7 +38,7 @@ enum PeerStateKind {
 mod peer_state {
     use std::cmp::min;
     use std::time::{Duration, Instant};
-    use crate::udp::client::{PeerStateKind, HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS, HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS, SAME_IP_RETRY_TIMEOUT_MS, LOCAL_DISCOVERY_DURATION_SECS};
+    use crate::udp::client::{PeerStateKind, HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS, HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS, LOCAL_DISCOVERY_DURATION_SECS};
 
     pub struct PeerState {
         /// Logical connection state for this peer
@@ -95,7 +95,6 @@ mod peer_state {
         pub fn on_error_same_ip(&mut self) {
             if matches!(self.state_kind, PeerStateKind::ConnectionActive) {
                 self.last_error_same_ip = Some(Instant::now());
-                self.state_kind = PeerStateKind::DisabledUntil(Instant::now() + Duration::from_millis(SAME_IP_RETRY_TIMEOUT_MS));
             }
         }
 
@@ -116,6 +115,12 @@ mod peer_state {
     }
 }
 
+struct LocalDiscovery {
+    local_discovery_config: LocalDiscoveryConfig,
+    multicast_discovery_socket: MulticastDiscoverySocket<[u8; 32]>,
+    socket: UdpSocket,
+}
+
 pub struct UdpConnectionEstablisher {
     p2p_server_addr: SocketAddrV4,
     trusted_remotes: BTreeMap<PublicKey, PeerState>,
@@ -123,12 +128,13 @@ pub struct UdpConnectionEstablisher {
     key: SigningKey,
     session_id: u32,
     socket: UdpSocket,
+    local_discovery: Option<LocalDiscovery>,
     p2p_interface_tracker: P2pInterfaceTracker,
     cur_interface: Option<String>,
-    multicast_discovery_socket: Option<MulticastDiscoverySocket<[u8; 32]>>,
     last_p2p_server_ping_send_tm: Option<Instant>,
     last_p2p_server_ping: Option<(Instant, u64)>,
     last_p2p_server_pong: Option<Instant>,
+    poll_start_tm: Option<Instant>,
 }
 
 const REQUEST_PLACEMENT_INTERVAL: u64 = 1;
@@ -169,9 +175,9 @@ async fn new_udp_socket(best_interface: Option<Interface>) -> UdpSocket {
     socket
 }
 
+#[derive(Clone)]
 pub struct LocalDiscoveryConfig {
     multicast_group_addr: Ipv4Addr,
-    port: u16,
     service_name: Cow<'static, str>,
     obfuscation_key: String,
 }
@@ -203,6 +209,8 @@ impl Debug for HolePunchError {
 }
 
 impl UdpConnectionEstablisher {
+    /// Create a new `UdpConnectionEstablisher` with the given signing key and P2P server address.
+    /// key is not validated for other peers! it is only used for signing messages to the P2P server and identification of other peers.
     pub async fn new(key: SigningKey, p2p_server_addr: SocketAddrV4, local_discovery_config: Option<LocalDiscoveryConfig>) -> UdpConnectionEstablisher {
         if let Some(error) = check_system_time_error().await {
             if error > 0.0 {
@@ -213,25 +221,36 @@ impl UdpConnectionEstablisher {
             }
         }
 
-        let multicast_discovery_socket = local_discovery_config.map(|local_discovery_config| {
-            let multicast_discovery_config = &MulticastDiscoveryConfig::new(local_discovery_config.multicast_group_addr, local_discovery_config.service_name);
-            MulticastDiscoverySocket::new_with_service(
+
+        let local_discovery = if let Some(local_discovery_config) = local_discovery_config {
+            let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.expect("Creating socket for local discovery");
+            let local_port = socket.local_addr().unwrap().port();
+            let multicast_discovery_config = &MulticastDiscoveryConfig::new(local_discovery_config.multicast_group_addr.clone(), local_discovery_config.service_name.clone());
+
+            Some(LocalDiscovery {
+                socket,
+                multicast_discovery_socket: MulticastDiscoverySocket::new_with_service(
                     multicast_discovery_config,
-                    local_discovery_config.port,
-                    transform_discovery_data(key.to_scalar_bytes(), local_discovery_config.obfuscation_key)).unwrap()
-        });
+                    local_port,
+                    transform_discovery_data(key.verifying_key().to_bytes(), local_discovery_config.obfuscation_key.clone())).unwrap(),
+                local_discovery_config
+            })
+        } else {
+            None
+        };
 
         let mut p2p_interface_tracker = P2pInterfaceTracker::new();
         UdpConnectionEstablisher {
             last_request_tm: None,
             trusted_remotes: BTreeMap::new(),
+            poll_start_tm: None,
             key,
             p2p_server_addr,
             session_id: random(),
             socket: new_udp_socket(p2p_interface_tracker.current_interface()).await,
             cur_interface: p2p_interface_tracker.current_interface().map(|i| i.name),
             p2p_interface_tracker,
-            multicast_discovery_socket,
+            local_discovery,
             last_p2p_server_ping_send_tm: None,
             last_p2p_server_ping: None,
             last_p2p_server_pong: None,
@@ -406,12 +425,19 @@ impl UdpConnectionEstablisher {
         Ok(cur_send_dst)
     }
 
+    fn is_local_discovery_enabled_for(&self, pubkey: &PublicKey) -> bool {
+        self.last_p2p_server_pong.is_some_and(|tm| tm.elapsed().as_secs() < 10)
+            || self.trusted_remotes.get(pubkey).map(|s| s.is_local_discovery_enabled()).unwrap_or(false)
+    }
+
     /// Block for `dur`, returning a new hole-punched connection or an error.
     /// The returned connection has already completed the full hole punch handshake
     /// and is ready for immediate send/recv use.
     ///
     /// In case of error or no clients to accept, block for 100ms
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<anyhow::Result<NewP2pConnection>> {
+        self.poll_start_tm = Some(Instant::now());
+
         let cur_interface = self.p2p_interface_tracker.current_interface();
         let cur_interface_name = cur_interface.as_ref().map(|i| i.name.clone());
         if cur_interface_name != self.cur_interface {
@@ -419,16 +445,42 @@ impl UdpConnectionEstablisher {
             self.cur_interface = cur_interface_name;
         }
 
-        // 1) multicast discovery
-        if let Some(socket) = self.multicast_discovery_socket.as_mut() {
-            socket.poll(|msg| {
+        if let Some(local_discovery) = self.local_discovery.as_mut() {
+            // 1) multicast discovery
+            // 1.1) announcement enable decision and polling
+            let announcement_enabled = self.poll_start_tm.is_some_and(|tm| tm.elapsed().as_secs() > LOCAL_DISCOVERY_ENABLE_DELAY_SECS) &&
+                (self.last_p2p_server_pong.is_some_and(|tm| tm.elapsed().as_secs() < 10) || self.trusted_remotes.iter().any(|(_, s)| s.is_local_discovery_enabled()));
+
+            local_discovery.multicast_discovery_socket.set_announce_en(announcement_enabled);
+            local_discovery.multicast_discovery_socket.set_discover_replies_en(announcement_enabled);
+
+            local_discovery.multicast_discovery_socket.poll(|msg| {
                 match msg {
                     PollResult::DiscoveredClient {
                         addr,
                         discover_id,
                         adv_data
                     } => {
+                        for pubkey in self.trusted_remotes.keys() {
+                            let remote_obf_key = transform_discovery_data(*pubkey, local_discovery.local_discovery_config.obfuscation_key.clone());
+                            if remote_obf_key == *adv_data {
+                                if self.is_local_discovery_enabled_for(pubkey) && self.trusted_remotes.get(pubkey).map(|s| s.is_discovery_enabled()).unwrap_or(false) {
+                                    info!("Discovered client {} via local discovery, trying to connect...", addr);
 
+                                    let mut buf = Vec::new();
+                                    buf.extend_from_slice(b"multicast-discovery-p2p");
+                                    buf.extend_from_slice(&self.key.verifying_key().to_bytes());
+                                    match local_discovery.socket.try_send_to(&buf, addr.into()) {
+                                        Ok(sz) => {
+
+                                        }
+                                        Err(e) => {
+
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     PollResult::DisconnectedClient {
                         addr,
@@ -438,18 +490,37 @@ impl UdpConnectionEstablisher {
                     }
                 }
             })
+
+            // 1.2) multicast discovery client connection
+            let mut buf = [0; 100];
+            if let Ok((sz, addr)) = local_discovery.socket.recv_from(&mut buf).await {
+                let msg = &buf[..sz];
+                let pattern = b"multicast-discovery-p2p";
+                if msg.starts_with(pattern) && msg.len() == 32 + pattern.len() {
+                    let pubkey_bytes = &msg[pattern.len()..];
+                    if let Ok(pubkey) = PublicKey::try_from(pubkey_bytes) {
+                        if self.is_local_discovery_enabled_for(&pubkey) && self.trusted_remotes.get(&pubkey).map(|s| s.is_discovery_enabled()).unwrap_or(false) {
+                            info!("Received multicast discovery connection from {} for pubkey {}, trying to connect...", addr, pubkey);
+
+                        }
+                    }
+            }
         }
 
         // 2.1) server-assisted discovery, server ping
         if self.last_p2p_server_ping_send_tm.is_none_or(|i| i.elapsed().as_secs() > 3) {
             self.last_p2p_server_ping_send_tm = Some(Instant::now());
+            let payload = random();
             let ping_packet = ToServerRawMessage::Ping {
-                payload: random(),
+                payload
             };
 
             let res = self.socket.send_to(&ping_packet.to_bytes(), self.p2p_server_addr).await;
             if let Err(e) = res {
                 warn!("Failed to send ping to p2p discovery server: {:?}", e);
+            }
+            else {
+                self.last_p2p_server_ping = Some((Instant::now(), payload));
             }
         }
         // 2.2) server-assisted discovery, send requests
