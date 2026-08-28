@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, Bound};
 use std::fmt::{Debug, Display, Formatter};
+use std::io::ErrorKind;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -501,6 +502,7 @@ impl UdpConnectionEstablisher {
                     }
                 });
 
+                const RESP_SIGNATURE: &'static [u8] = b"multicast-discovery-p2p";
                 if let Some((addr, pubkey)) = res {
                     info!("Discovered client {} via local discovery, trying to connect...", addr);
                     let mut buf = Vec::new();
@@ -508,20 +510,41 @@ impl UdpConnectionEstablisher {
                     buf.extend_from_slice(&self.key.verifying_key().to_bytes());
 
                     let socket = new_udp_socket(self.p2p_interface_tracker.current_interface()).await;
-                    socket.connect(addr).await.unwrap();
-                    match socket.try_send_to(&buf, addr.into()) {
+                    match socket.send_to(&buf, addr).await {
                         Ok(sz) => {
                             if sz != buf.len() {
-                                warn!("[local disyovery connection] Invalid sent data size!");
+                                warn!("[local discovery connection] Invalid sent data size!");
                                 break 'local_discovery;
                             }
                         }
                         Err(e) => {
-                            warn!("[local discovery connection] Failed to send udp message");
+                            warn!("[local discovery connection] Failed to send udp message: {:?}", e);
                             break 'local_discovery;
                         }
                     }
 
+                    // 500ms to recv response
+                    let mut buf = [0; RESP_SIGNATURE.len() + 32];
+                    match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+                        Ok(Ok((_, addr))) => {
+                            if !buf.starts_with(RESP_SIGNATURE) {
+                                warn!("Invalid packet signature in local connection confirmation!");
+                                break 'local_discovery;
+                            }
+                            if !buf.ends_with(pubkey) {
+                                warn!("Invalid pubkey in local connection confirmation!");
+                                break 'local_discovery;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Error while receiving local connection confirmation: {:?}", e);
+                            break 'local_discovery;
+                        }
+                        Err(_) => {
+                            warn!("Timeout while receiving local connection confirmation");
+                            break 'local_discovery;
+                        }
+                    }
 
                     return Some(Ok(NewP2pConnection {
                         pubkey: *pubkey,
@@ -533,28 +556,52 @@ impl UdpConnectionEstablisher {
 
                 // 1.2) multicast discovery client connection
                 let mut buf = [0; 100];
-                if let Ok((sz, addr)) = local_discovery.socket.try_recv_from(&mut buf) {
-                    let msg = &buf[..sz];
-                    let pattern = b"multicast-discovery-p2p";
-                    if msg.starts_with(pattern) && msg.len() == 32 + pattern.len() {
-                        let pubkey_bytes = &msg[pattern.len()..];
-                        if let Ok(pubkey) = PublicKey::try_from(pubkey_bytes) {
-                            if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) && self.trusted_remotes.get(&pubkey).map(|s| s.is_server_discovery_enabled()).unwrap_or(false) {
-                                info!("Received multicast discovery connection from {}, trying to connect...", addr);
+                match local_discovery.socket.try_recv_from(&mut buf) {
+                    Ok((sz, addr)) => {
+                        let msg = &buf[..sz];
+                        let pattern = b"multicast-discovery-p2p";
+                        if msg.starts_with(pattern) && msg.len() == 32 + pattern.len() {
+                            let pubkey_bytes = &msg[pattern.len()..];
+                            if let Ok(pubkey) = PublicKey::try_from(pubkey_bytes) {
+                                // send response
 
-                                let socket = mem::replace(&mut local_discovery.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
-                                *local_discovery.multicast_discovery_socket.local_service_port().unwrap() = local_discovery.socket.local_addr().unwrap().port();
-                                socket.connect(addr).await.unwrap();
+                                info!("Recv packet to multicast discovery socket! sending response...");
+                                let mut resp = vec![];
+                                resp.extend_from_slice(RESP_SIGNATURE);
+                                resp.extend_from_slice(self.key.verifying_key().as_bytes());
+                                if let Err(e) = local_discovery.socket.send_to(&resp, addr).await {
+                                    warn!("Failed to send local discovery confirmation: {:?}", e);
+                                }
 
-                                return Some(Ok(NewP2pConnection {
-                                    pubkey,
-                                    remote_addr: addr,
-                                    is_listener: true,
-                                    socket,
-                                }))
+                                if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) {
+                                    info!("Received multicast discovery connection from {}, trying to connect...", addr);
+
+                                    let socket = mem::replace(&mut local_discovery.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
+                                    *local_discovery.multicast_discovery_socket.local_service_port().unwrap() = local_discovery.socket.local_addr().unwrap().port();
+
+                                    return Some(Ok(NewP2pConnection {
+                                        pubkey,
+                                        remote_addr: addr,
+                                        is_listener: true,
+                                        socket,
+                                    }))
+                                }
+                                else {
+                                    warn!("local discovery is disabled for local discovery connection request!")
+                                }
+                            }
+                            else {
+                                warn!("Invalid pubkey for local discovery connection request!")
                             }
                         }
+                        else {
+                            warn!("Invalid signature for local discovery connection request!")
+                        }
                     }
+                    Err(e) if e.kind() != ErrorKind::WouldBlock => {
+                        warn!("Error receiving packet from local discovery socket: {:?}", e)
+                    }
+                    _ => {}
                 }
             }
         }
@@ -638,7 +685,6 @@ impl UdpConnectionEstablisher {
                                 // mark connection as connected (or connection in progress)
                                 state.on_connection_established();
                                 self.last_request_tm = None; // retry immediately on next poll
-                                socket.connect(actual_peer_addr).await.unwrap();
                                 Some(Ok(NewP2pConnection {
                                     pubkey: peer_pubkey,
                                     remote_addr: actual_peer_addr,
