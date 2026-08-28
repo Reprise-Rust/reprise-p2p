@@ -38,6 +38,7 @@ enum PeerStateKind {
 mod peer_state {
     use std::cmp::min;
     use std::time::{Duration, Instant};
+    use log::info;
     use crate::udp::client::{PeerStateKind, HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS, HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS, LOCAL_DISCOVERY_DURATION_SECS};
 
     pub struct PeerState {
@@ -53,12 +54,16 @@ mod peer_state {
 
 
     impl PeerState {
-        pub fn is_discovery_enabled(&self) -> bool {
+        pub fn is_server_discovery_enabled(&self) -> bool {
             !self.is_local_discovery_enabled() && match self.state_kind {
                 PeerStateKind::ConnectionActive => false,
                 PeerStateKind::DisabledUntil(i) => i < Instant::now(),
                 PeerStateKind::Enabled => true,
             }
+        }
+
+        pub fn is_local_discovery_enabled(&self) -> bool {
+            self.last_error_same_ip.is_some_and(|t| t.elapsed() < Duration::from_secs(LOCAL_DISCOVERY_DURATION_SECS))
         }
 
         /// Can only be called after creation or on_hole_punch_err/resume_discovery/on_new_connection_request
@@ -80,6 +85,13 @@ mod peer_state {
             self.failure_retry_timeout = self.failure_retry_timeout.min(Duration::from_millis(HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS));
         }
 
+        pub fn on_error_same_ip(&mut self) {
+            if !matches!(self.state_kind, PeerStateKind::ConnectionActive) {
+                self.last_error_same_ip = Some(Instant::now());
+                info!("Got err same ip");
+            }
+        }
+
         /// Can only be called after on_new_connection_request
         pub fn on_connection_established(&mut self) {
             self.state_kind = PeerStateKind::ConnectionActive;
@@ -90,16 +102,6 @@ mod peer_state {
         /// Can only be called after on_connection_established
         pub fn resume_discovery(&mut self) {
             self.state_kind = PeerStateKind::Enabled;
-        }
-
-        pub fn on_error_same_ip(&mut self) {
-            if matches!(self.state_kind, PeerStateKind::ConnectionActive) {
-                self.last_error_same_ip = Some(Instant::now());
-            }
-        }
-
-        pub fn is_local_discovery_enabled(&self) -> bool {
-            self.last_error_same_ip.is_some_and(|t| t.elapsed() < Duration::from_secs(LOCAL_DISCOVERY_DURATION_SECS))
         }
     }
 
@@ -134,6 +136,7 @@ pub struct UdpConnectionEstablisher {
     last_p2p_server_ping_send_tm: Option<Instant>,
     last_p2p_server_ping: Option<(Instant, u64)>,
     last_p2p_server_pong: Option<Instant>,
+    /// Keep first 5 seconds of polling with local discovery disabled
     poll_start_tm: Option<Instant>,
 }
 
@@ -177,9 +180,9 @@ async fn new_udp_socket(best_interface: Option<Interface>) -> UdpSocket {
 
 #[derive(Clone)]
 pub struct LocalDiscoveryConfig {
-    multicast_group_addr: Ipv4Addr,
-    service_name: Cow<'static, str>,
-    obfuscation_key: String,
+    pub multicast_group_addr: Ipv4Addr,
+    pub service_name: Cow<'static, str>,
+    pub obfuscation_key: String,
 }
 
 #[derive(Error)]
@@ -301,7 +304,7 @@ impl UdpConnectionEstablisher {
     /// Take up to 50 trusted remotes. If there are more than 50, pick exactly 50 at random.
     fn new_available_remotes_list(&mut self) -> Vec<PublicKey> {
         let mut available: Vec<PublicKey> = self.trusted_remotes.iter()
-            .filter(|(_, s)| s.is_discovery_enabled())
+            .filter(|(_, s)| s.is_server_discovery_enabled())
             .map(|(k, _)| *k)
             .collect();
 
@@ -431,7 +434,9 @@ impl UdpConnectionEstablisher {
     ///
     /// In case of error or no clients to accept, block for 100ms
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<anyhow::Result<NewP2pConnection>> {
-        self.poll_start_tm = Some(Instant::now());
+        if self.poll_start_tm.is_none() {
+            self.poll_start_tm = Some(Instant::now());
+        }
 
         let cur_interface = self.p2p_interface_tracker.current_interface().clone();
         let cur_interface_name = cur_interface.as_ref().map(|i| i.name.clone());
@@ -465,7 +470,7 @@ impl UdpConnectionEstablisher {
                             for pubkey in self.trusted_remotes.keys() {
                                 let remote_obf_key = transform_discovery_data(*pubkey, local_discovery.local_discovery_config.obfuscation_key.clone());
                                 if remote_obf_key == *adv_data {
-                                    if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) && self.trusted_remotes.get(pubkey).map(|s| s.is_discovery_enabled()).unwrap_or(false) {
+                                    if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) && self.trusted_remotes.get(pubkey).map(|s| s.is_server_discovery_enabled()).unwrap_or(false) {
                                         res = Some((addr, pubkey));
                                     }
                                 }
@@ -511,13 +516,13 @@ impl UdpConnectionEstablisher {
 
                 // 1.2) multicast discovery client connection
                 let mut buf = [0; 100];
-                if let Ok((sz, addr)) = local_discovery.socket.recv_from(&mut buf).await {
+                if let Ok((sz, addr)) = local_discovery.socket.try_recv_from(&mut buf) {
                     let msg = &buf[..sz];
                     let pattern = b"multicast-discovery-p2p";
                     if msg.starts_with(pattern) && msg.len() == 32 + pattern.len() {
                         let pubkey_bytes = &msg[pattern.len()..];
                         if let Ok(pubkey) = PublicKey::try_from(pubkey_bytes) {
-                            if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) && self.trusted_remotes.get(&pubkey).map(|s| s.is_discovery_enabled()).unwrap_or(false) {
+                            if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) && self.trusted_remotes.get(&pubkey).map(|s| s.is_server_discovery_enabled()).unwrap_or(false) {
                                 info!("Received multicast discovery connection from {}, trying to connect...", addr);
 
                                 let socket = mem::replace(&mut local_discovery.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
@@ -565,15 +570,13 @@ impl UdpConnectionEstablisher {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 return Some(Err(e).context("Placing connection request to P2P server"));
             }
+            info!("Placed connection request to server");
         }
 
         let mut buf = vec![0; 2000];
         match timeout(dur, self.socket.recv_from(&mut buf)).await {
             Ok(Ok((sz, addr))) => {
-                // 1) try parse as local network connection request
-
-
-                // 2) parse as p2p server message
+                // 1) parse as p2p server message
                 if addr != self.p2p_server_addr.into() {
                     warn!("Ignoring UDP packet not from p2p server");
                     return None;
@@ -591,7 +594,7 @@ impl UdpConnectionEstablisher {
                             // use new session id for all future requests
                             let context = format!("Handling InitiateConnectionRequest from p2p server for peer {}, session_id={}", peer_address, remote_session_id);
                             if let Some(state) = self.trusted_remotes.get_mut(&peer_pubkey) {
-                                if !state.is_discovery_enabled() {
+                                if !state.is_server_discovery_enabled() {
                                     // According to local state, we are already connected to this client.
                                     debug!("Got duplicate connection notification, ignoring");
                                     return None;
@@ -603,6 +606,7 @@ impl UdpConnectionEstablisher {
                                 }
 
                                 // New valid connection request received from p2p server, swapping sockets and setting up new session id
+                                info!("Starting server-initiated p2p connection to {}", peer_address);
                                 let socket = mem::replace(&mut self.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
                                 self.session_id = random();
 

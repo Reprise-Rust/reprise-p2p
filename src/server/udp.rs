@@ -147,6 +147,8 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                             if let Err(e) = socket.send_to(&to_new_bytes, addr).await {
                                                 warn!("[Reprise:UDP] Failed to send to new requester {}: {}", addr, e);
                                             }
+
+                                            info!("After err same ip: {:?}", state.requests.keys().collect::<Vec<_>>());
                                         }
                                         else {
                                             pending_request = Some(req);

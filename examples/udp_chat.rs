@@ -7,14 +7,21 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use log::{error, info, Level};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
-use reprise_p2p::udp::client::UdpConnectionEstablisher;
+use reprise_p2p::udp::client::{LocalDiscoveryConfig, UdpConnectionEstablisher};
 
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(Level::Info).unwrap();
 
     let local_discovery_config = if env::args().nth(1).is_some_and(|a| a == "--local-disc") {
-        
+        info!("Starting with local multicast discovery...");
+        Some(LocalDiscoveryConfig{
+            service_name: "reprise-p2p:chat-example".into(),
+            multicast_group_addr: Ipv4Addr::new(229, 12,82, 12),
+            obfuscation_key: "udp-chat-key".into(),
+        })
+    } else {
+        None
     };
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::new(155, 212, 168, 136), 47002);
