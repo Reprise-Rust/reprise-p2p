@@ -129,6 +129,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                         // check for the same ip addr
                                         let peer_addr = req.requester_addr;
                                         if peer_addr.ip() == addr.ip() {
+                                            info!("Same ip matching request: {}", addr.ip())
                                             let to_original = FromServerMessage::ErrorSameIp {
                                                 peer_pubkey: sender_pubkey,
                                             };
