@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::env;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -124,14 +125,18 @@ async fn run_chat_session(
             }
             recv = socket.recv(&mut buf) => {
                 match recv {
+                    Ok(0) => {
+                        println!("Connection closed!")
+                    }
                     Ok(sz) => {
                         let msg = String::from_utf8_lossy(&buf[..sz]);
                         println!("<peer> {}", msg);
                     }
-                    Err(_) => {
-                        println!("Connection lost.");
+                    Err(e) if e.kind() != ErrorKind::WouldBlock => {
+                        println!("Connection error! {:?}", e);
                         break;
                     }
+                    _ => {}
                 }
             }
         }

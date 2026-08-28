@@ -138,6 +138,8 @@ pub struct UdpConnectionEstablisher {
     last_p2p_server_pong: Option<Instant>,
     /// Keep first 5 seconds of polling with local discovery disabled
     poll_start_tm: Option<Instant>,
+
+    prev_announcements_enabled: bool,
 }
 
 const REQUEST_PLACEMENT_INTERVAL: u64 = 1;
@@ -257,6 +259,7 @@ impl UdpConnectionEstablisher {
             last_p2p_server_ping_send_tm: None,
             last_p2p_server_ping: None,
             last_p2p_server_pong: None,
+            prev_announcements_enabled: false,
         }
     }
 
@@ -458,6 +461,14 @@ impl UdpConnectionEstablisher {
 
                 local_discovery.multicast_discovery_socket.set_announce_en(announcement_enabled);
                 local_discovery.multicast_discovery_socket.set_discover_replies_en(announcement_enabled);
+
+                if announcement_enabled && !self.prev_announcements_enabled {
+                    info!("*** Enabling local discovery!")
+                }
+                if !announcement_enabled && self.prev_announcements_enabled {
+                    info!("*** Disabling local discovery!")
+                }
+                self.prev_announcements_enabled = announcement_enabled;
 
                 let mut res = None;
                 local_discovery.multicast_discovery_socket.poll(|msg| {

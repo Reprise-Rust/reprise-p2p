@@ -56,7 +56,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
 
     let mut state = UdpState::new();
     let mut buf = vec![0u8; 2000];
-    loop {
+    'outer: loop {
         select! {
             res = socket.recv_from(&mut buf) => {
                 if let Err(e) = res {
@@ -148,7 +148,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                                 warn!("[Reprise:UDP] Failed to send to new requester {}: {}", addr, e);
                                             }
 
-                                            continue;
+                                            continue 'outer;
                                         }
                                         else {
                                             pending_request = Some(req);
