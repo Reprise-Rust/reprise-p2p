@@ -113,7 +113,8 @@ async fn run_chat_session(
                         break;
                     }
                     Some(msg) => {
-                        if socket.send(msg.as_bytes()).await.is_err() {
+                        if let Err(e) = socket.send(msg.as_bytes()).await {
+                            error!("send error: {:?}", e);
                             break;
                         }
                     }

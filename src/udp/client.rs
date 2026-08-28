@@ -457,7 +457,7 @@ impl UdpConnectionEstablisher {
                 // 1) multicast discovery
                 // 1.1) announcement enable decision and polling
                 let announcement_enabled = self.poll_start_tm.is_some_and(|tm| tm.elapsed().as_secs() > LOCAL_DISCOVERY_ENABLE_DELAY_SECS) &&
-                    (self.last_p2p_server_pong.is_some_and(|tm| tm.elapsed().as_secs() < 10) || self.trusted_remotes.iter().any(|(_, s)| s.is_local_discovery_enabled()));
+                    (self.last_p2p_server_pong.is_none_or(|tm| tm.elapsed().as_secs() > 10) || self.trusted_remotes.iter().any(|(_, s)| s.is_local_discovery_enabled()));
 
                 local_discovery.multicast_discovery_socket.set_announce_en(announcement_enabled);
                 local_discovery.multicast_discovery_socket.set_discover_replies_en(announcement_enabled);
@@ -478,11 +478,15 @@ impl UdpConnectionEstablisher {
                             discover_id,
                             adv_data
                         } => {
+                            info!("** local discovery: discovered {:?}", addr);
                             for pubkey in self.trusted_remotes.keys() {
                                 let remote_obf_key = transform_discovery_data(*pubkey, local_discovery.local_discovery_config.obfuscation_key.clone());
                                 if remote_obf_key == *adv_data {
-                                    if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) && self.trusted_remotes.get(pubkey).map(|s| s.is_server_discovery_enabled()).unwrap_or(false) {
+                                    if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) {
                                         res = Some((addr, pubkey));
+                                    }
+                                    else {
+                                        warn!("Discovered client, but discovery is not enabled for them!");
                                     }
                                 }
                             }
@@ -516,6 +520,7 @@ impl UdpConnectionEstablisher {
                     }
 
                     let socket = new_udp_socket(self.p2p_interface_tracker.current_interface()).await;
+                    socket.connect(addr).await.unwrap();
 
                     return Some(Ok(NewP2pConnection {
                         pubkey: *pubkey,
@@ -538,6 +543,7 @@ impl UdpConnectionEstablisher {
 
                                 let socket = mem::replace(&mut local_discovery.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
                                 *local_discovery.multicast_discovery_socket.local_service_port().unwrap() = local_discovery.socket.local_addr().unwrap().port();
+                                socket.connect(addr).await.unwrap();
 
                                 return Some(Ok(NewP2pConnection {
                                     pubkey,
@@ -631,6 +637,7 @@ impl UdpConnectionEstablisher {
                                 // mark connection as connected (or connection in progress)
                                 state.on_connection_established();
                                 self.last_request_tm = None; // retry immediately on next poll
+                                socket.connect(actual_peer_addr).await.unwrap();
                                 Some(Ok(NewP2pConnection {
                                     pubkey: peer_pubkey,
                                     remote_addr: actual_peer_addr,
@@ -693,7 +700,7 @@ impl UdpConnectionEstablisher {
 
 
 fn is_local_discovery_enabled_for(last_p2p_server_pong: &Option<Instant>, trusted_remotes: &BTreeMap<PublicKey, PeerState>, pubkey: &PublicKey) -> bool {
-    last_p2p_server_pong.is_some_and(|tm| tm.elapsed().as_secs() < 10)
+    last_p2p_server_pong.is_none_or(|tm| tm.elapsed().as_secs() > 10)
         || trusted_remotes.get(pubkey).map(|s| s.is_local_discovery_enabled()).unwrap_or(false)
 }
 
