@@ -506,7 +506,10 @@ impl UdpConnectionEstablisher {
                     let mut buf = Vec::new();
                     buf.extend_from_slice(b"multicast-discovery-p2p");
                     buf.extend_from_slice(&self.key.verifying_key().to_bytes());
-                    match local_discovery.socket.try_send_to(&buf, addr.into()) {
+
+                    let socket = new_udp_socket(self.p2p_interface_tracker.current_interface()).await;
+                    socket.connect(addr).await.unwrap();
+                    match socket.try_send_to(&buf, addr.into()) {
                         Ok(sz) => {
                             if sz != buf.len() {
                                 warn!("[local disyovery connection] Invalid sent data size!");
@@ -519,8 +522,6 @@ impl UdpConnectionEstablisher {
                         }
                     }
 
-                    let socket = new_udp_socket(self.p2p_interface_tracker.current_interface()).await;
-                    socket.connect(addr).await.unwrap();
 
                     return Some(Ok(NewP2pConnection {
                         pubkey: *pubkey,
