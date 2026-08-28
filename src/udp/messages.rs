@@ -315,6 +315,17 @@ impl FromServerMessage {
                     peer_pubkey
                 }
             }
+            4 => {
+                if bytes.len() < 8 {
+                    return Err(ParseError::TooShort);
+                }
+
+                let payload = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+
+                Self::Pong {
+                    payload
+                }
+            }
             _ => {
                 return Err(ParseError::InvalidMessageId(msg_id));
             }
