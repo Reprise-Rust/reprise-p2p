@@ -566,11 +566,12 @@ impl UdpConnectionEstablisher {
                 return None; // No requests to put on P2P server
             }
 
+            let trusted_peers_len = peer_pubkeys_list.len();
             if let Err(e) = self.place_connection_requests(peer_pubkeys_list).await {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 return Some(Err(e).context("Placing connection request to P2P server"));
             }
-            info!("Placed connection request to server");
+            info!("Placed connection request to server ({} trusted peers)", trusted_peers_len);
         }
 
         let mut buf = vec![0; 2000];
