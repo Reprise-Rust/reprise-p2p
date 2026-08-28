@@ -102,7 +102,6 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                 session_id
                             } => {
                                 state.cleanup();
-                                info!("Connection request from {:?}, trusted pubkeys: {:?}", &sender_pubkey[..4], &peer_pubkeys[0][..4]);
 
                                 // 1) check last established connection for this user, session must be different
                                 if let Some(active_session) = state.last_session_ids.get(&sender_pubkey) && active_session.session_id == session_id {
@@ -124,7 +123,6 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                     if state.requests.get_mut(peer_pubkey).is_some_and(|r| {
                                         r.trusted_remotes.iter().any(|k| k == &sender_pubkey)
                                     }) {
-                                        info!(" > Found matching request!");
                                         // found matching incoming request, remove it
                                         let req = state.requests.remove(peer_pubkey).unwrap();
 
@@ -200,7 +198,6 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                     });
                                 }
                                 else {
-                                    info!(" --> Saving request");
                                     state.requests.insert(sender_pubkey,
                                         RequestInfo {
                                             requester_pubkey: sender_pubkey,
