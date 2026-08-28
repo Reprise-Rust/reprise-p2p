@@ -127,7 +127,7 @@ pub async fn run_udp_server(port: u16, mut shutdown: ShutdownListener) {
                                         let req = state.requests.remove(peer_pubkey).unwrap();
 
                                         // check for the same ip addr
-                                        let peer_addr = state.requests.get(peer_pubkey).as_ref().unwrap().requester_addr;
+                                        let peer_addr = req.requester_addr;
                                         if peer_addr == addr {
                                             let to_original = FromServerMessage::ErrorSameIp {
                                                 peer_pubkey: sender_pubkey,
