@@ -1095,9 +1095,9 @@ dependencies = [
 
 [[package]]
 name = "multicast-discovery-socket"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04daa527053a09309aeb5a5ca048d50404278c24fd251bee98e94a22191fd2de"
+checksum = "1a134c6323b35f9a62462a94dcd65e1bcd7bdf29c9e29b8bb1a72a0e9540a38e"
 dependencies = [
  "bincode",
  "cfg-expr",

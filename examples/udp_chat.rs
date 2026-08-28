@@ -1,3 +1,4 @@
+use std::env;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
@@ -11,6 +12,10 @@ use reprise_p2p::udp::client::UdpConnectionEstablisher;
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(Level::Info).unwrap();
+
+    let local_discovery_config = if env::args().nth(1).is_some_and(|a| a == "--local-disc") {
+        
+    };
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::new(155, 212, 168, 136), 47002);
 
@@ -42,7 +47,7 @@ async fn main() {
     };
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
-    let mut client = UdpConnectionEstablisher::new(signing_key, server_addr, None).await;
+    let mut client = UdpConnectionEstablisher::new(signing_key, server_addr, local_discovery_config).await;
     client.add_trusted_remote(peer_key);
     println!("Initialized, waiting for connection...");
 

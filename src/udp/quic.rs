@@ -43,13 +43,13 @@ pub async fn make_quin_endpoint(endpoint_config: EndpointConfig, transport_confi
     Ok(ep)
 }
 
-pub async fn establish_client_quic_connection(ep: Endpoint) -> anyhow::Result<Connection> {
+pub async fn establish_server_quic_connection(ep: Endpoint) -> anyhow::Result<Connection> {
     let incoming = ep.accept().await.context("Failed to accept QUIC connection")?;
     let con = incoming.await?;
     Ok(con)
 }
 
-pub async fn establish_server_quic_connection(
+pub async fn establish_client_quic_connection(
     mut ep: Endpoint,
     transport_config: Arc<TransportConfig>,
     signing_key: &SigningKey,

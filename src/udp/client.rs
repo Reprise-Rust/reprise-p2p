@@ -425,11 +425,6 @@ impl UdpConnectionEstablisher {
         Ok(cur_send_dst)
     }
 
-    fn is_local_discovery_enabled_for(&self, pubkey: &PublicKey) -> bool {
-        self.last_p2p_server_pong.is_some_and(|tm| tm.elapsed().as_secs() < 10)
-            || self.trusted_remotes.get(pubkey).map(|s| s.is_local_discovery_enabled()).unwrap_or(false)
-    }
-
     /// Block for `dur`, returning a new hole-punched connection or an error.
     /// The returned connection has already completed the full hole punch handshake
     /// and is ready for immediate send/recv use.
@@ -438,72 +433,106 @@ impl UdpConnectionEstablisher {
     pub async fn poll_accept(&mut self, dur: Duration) -> Option<anyhow::Result<NewP2pConnection>> {
         self.poll_start_tm = Some(Instant::now());
 
-        let cur_interface = self.p2p_interface_tracker.current_interface();
+        let cur_interface = self.p2p_interface_tracker.current_interface().clone();
         let cur_interface_name = cur_interface.as_ref().map(|i| i.name.clone());
         if cur_interface_name != self.cur_interface {
-            self.socket = new_udp_socket(cur_interface).await;
+            self.socket = new_udp_socket(cur_interface.clone()).await;
+            if let Some(ref mut local_disc) = self.local_discovery {
+                local_disc.socket = new_udp_socket(cur_interface.clone()).await;
+                *local_disc.multicast_discovery_socket.local_service_port().unwrap() = local_disc.socket.local_addr().unwrap().port();
+            }
             self.cur_interface = cur_interface_name;
         }
 
         if let Some(local_discovery) = self.local_discovery.as_mut() {
-            // 1) multicast discovery
-            // 1.1) announcement enable decision and polling
-            let announcement_enabled = self.poll_start_tm.is_some_and(|tm| tm.elapsed().as_secs() > LOCAL_DISCOVERY_ENABLE_DELAY_SECS) &&
-                (self.last_p2p_server_pong.is_some_and(|tm| tm.elapsed().as_secs() < 10) || self.trusted_remotes.iter().any(|(_, s)| s.is_local_discovery_enabled()));
+            'local_discovery: {
+                // 1) multicast discovery
+                // 1.1) announcement enable decision and polling
+                let announcement_enabled = self.poll_start_tm.is_some_and(|tm| tm.elapsed().as_secs() > LOCAL_DISCOVERY_ENABLE_DELAY_SECS) &&
+                    (self.last_p2p_server_pong.is_some_and(|tm| tm.elapsed().as_secs() < 10) || self.trusted_remotes.iter().any(|(_, s)| s.is_local_discovery_enabled()));
 
-            local_discovery.multicast_discovery_socket.set_announce_en(announcement_enabled);
-            local_discovery.multicast_discovery_socket.set_discover_replies_en(announcement_enabled);
+                local_discovery.multicast_discovery_socket.set_announce_en(announcement_enabled);
+                local_discovery.multicast_discovery_socket.set_discover_replies_en(announcement_enabled);
 
-            local_discovery.multicast_discovery_socket.poll(|msg| {
-                match msg {
-                    PollResult::DiscoveredClient {
-                        addr,
-                        discover_id,
-                        adv_data
-                    } => {
-                        for pubkey in self.trusted_remotes.keys() {
-                            let remote_obf_key = transform_discovery_data(*pubkey, local_discovery.local_discovery_config.obfuscation_key.clone());
-                            if remote_obf_key == *adv_data {
-                                if self.is_local_discovery_enabled_for(pubkey) && self.trusted_remotes.get(pubkey).map(|s| s.is_discovery_enabled()).unwrap_or(false) {
-                                    info!("Discovered client {} via local discovery, trying to connect...", addr);
-
-                                    let mut buf = Vec::new();
-                                    buf.extend_from_slice(b"multicast-discovery-p2p");
-                                    buf.extend_from_slice(&self.key.verifying_key().to_bytes());
-                                    match local_discovery.socket.try_send_to(&buf, addr.into()) {
-                                        Ok(sz) => {
-
-                                        }
-                                        Err(e) => {
-
-                                        }
+                let mut res = None;
+                local_discovery.multicast_discovery_socket.poll(|msg| {
+                    match msg {
+                        PollResult::DiscoveredClient {
+                            addr,
+                            discover_id,
+                            adv_data
+                        } => {
+                            for pubkey in self.trusted_remotes.keys() {
+                                let remote_obf_key = transform_discovery_data(*pubkey, local_discovery.local_discovery_config.obfuscation_key.clone());
+                                if remote_obf_key == *adv_data {
+                                    if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) && self.trusted_remotes.get(pubkey).map(|s| s.is_discovery_enabled()).unwrap_or(false) {
+                                        res = Some((addr, pubkey));
                                     }
                                 }
                             }
                         }
-                    }
-                    PollResult::DisconnectedClient {
-                        addr,
-                        discover_id
-                    } => {
+                        PollResult::DisconnectedClient {
+                            addr,
+                            discover_id
+                        } => {
 
-                    }
-                }
-            })
-
-            // 1.2) multicast discovery client connection
-            let mut buf = [0; 100];
-            if let Ok((sz, addr)) = local_discovery.socket.recv_from(&mut buf).await {
-                let msg = &buf[..sz];
-                let pattern = b"multicast-discovery-p2p";
-                if msg.starts_with(pattern) && msg.len() == 32 + pattern.len() {
-                    let pubkey_bytes = &msg[pattern.len()..];
-                    if let Ok(pubkey) = PublicKey::try_from(pubkey_bytes) {
-                        if self.is_local_discovery_enabled_for(&pubkey) && self.trusted_remotes.get(&pubkey).map(|s| s.is_discovery_enabled()).unwrap_or(false) {
-                            info!("Received multicast discovery connection from {} for pubkey {}, trying to connect...", addr, pubkey);
 
                         }
                     }
+                });
+
+                if let Some((addr, pubkey)) = res {
+                    info!("Discovered client {} via local discovery, trying to connect...", addr);
+                    let mut buf = Vec::new();
+                    buf.extend_from_slice(b"multicast-discovery-p2p");
+                    buf.extend_from_slice(&self.key.verifying_key().to_bytes());
+                    match local_discovery.socket.try_send_to(&buf, addr.into()) {
+                        Ok(sz) => {
+                            if sz != buf.len() {
+                                warn!("[local disyovery connection] Invalid sent data size!");
+                                break 'local_discovery;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[local discovery connection] Failed to send udp message");
+                            break 'local_discovery;
+                        }
+                    }
+
+                    let socket = new_udp_socket(self.p2p_interface_tracker.current_interface()).await;
+
+                    return Some(Ok(NewP2pConnection {
+                        pubkey: *pubkey,
+                        remote_addr: addr.into(),
+                        is_listener: false,
+                        socket
+                    }))
+                }
+
+                // 1.2) multicast discovery client connection
+                let mut buf = [0; 100];
+                if let Ok((sz, addr)) = local_discovery.socket.recv_from(&mut buf).await {
+                    let msg = &buf[..sz];
+                    let pattern = b"multicast-discovery-p2p";
+                    if msg.starts_with(pattern) && msg.len() == 32 + pattern.len() {
+                        let pubkey_bytes = &msg[pattern.len()..];
+                        if let Ok(pubkey) = PublicKey::try_from(pubkey_bytes) {
+                            if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) && self.trusted_remotes.get(&pubkey).map(|s| s.is_discovery_enabled()).unwrap_or(false) {
+                                info!("Received multicast discovery connection from {}, trying to connect...", addr);
+
+                                let socket = mem::replace(&mut local_discovery.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
+                                *local_discovery.multicast_discovery_socket.local_service_port().unwrap() = local_discovery.socket.local_addr().unwrap().port();
+
+                                return Some(Ok(NewP2pConnection {
+                                    pubkey,
+                                    remote_addr: addr,
+                                    is_listener: true,
+                                    socket,
+                                }))
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -648,6 +677,13 @@ impl UdpConnectionEstablisher {
     }
 }
 
+
+fn is_local_discovery_enabled_for(last_p2p_server_pong: &Option<Instant>, trusted_remotes: &BTreeMap<PublicKey, PeerState>, pubkey: &PublicKey) -> bool {
+    last_p2p_server_pong.is_some_and(|tm| tm.elapsed().as_secs() < 10)
+        || trusted_remotes.get(pubkey).map(|s| s.is_local_discovery_enabled()).unwrap_or(false)
+}
+
+
 // If Some => your system time is off by `value` hours from real time
 pub async fn check_system_time_error() -> Option<f32> {
     let system_time = Utc::now();
@@ -741,9 +777,9 @@ impl UdpQuicConnectionEstablisher {
         };
 
         let res = if is_listener {
-            quic::establish_server_quic_connection(ep, self.transport_config.clone(), &self.signing_key, remote_addr, remote_pubkey).await.context("Establishing server quic connection")
+            quic::establish_server_quic_connection(ep).await.context("Establishing client quic connection")
         } else {
-            quic::establish_client_quic_connection(ep).await.context("Establishing client quic connection")
+            quic::establish_client_quic_connection(ep, self.transport_config.clone(), &self.signing_key, remote_addr, remote_pubkey).await.context("Establishing server quic connection")
         };
         match res {
             Ok(quic_connection) => {
