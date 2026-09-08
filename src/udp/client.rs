@@ -138,6 +138,8 @@ pub struct UdpConnectionEstablisher {
     last_p2p_server_ping_send_tm: Option<Instant>,
     last_p2p_server_ping: Option<(Instant, u64)>,
     last_p2p_server_pong: Option<Instant>,
+
+    /// Sticky state: true on ping, false on poll + time with no ping
     server_online: bool,
     /// Keep first 5 seconds of polling with local discovery disabled
     poll_start_tm: Option<Instant>,
@@ -153,6 +155,7 @@ pub struct NewP2pConnection {
     pub remote_addr: SocketAddr,
     pub socket: UdpSocket,
     pub is_listener: bool,
+    pub is_local_discovered: bool,
 }
 
 async fn new_udp_socket(best_interface: Option<Interface>) -> UdpSocket {
@@ -333,6 +336,7 @@ impl UdpConnectionEstablisher {
 
         available
     }
+
     async fn place_connection_requests(&mut self, peer_pubkeys_list: Vec<PublicKey>) -> anyhow::Result<()> {
         let socket = &self.socket;
 
@@ -540,6 +544,7 @@ impl UdpConnectionEstablisher {
                     }
 
                     // 500ms to recv response
+                    // todo: multiple recv attempts, ignore junk
                     let mut buf = [0; RESP_SIGNATURE.len() + 32];
                     match timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
                         Ok(Ok((_, addr))) => {
@@ -566,6 +571,7 @@ impl UdpConnectionEstablisher {
                         pubkey: *pubkey,
                         remote_addr: addr.into(),
                         is_listener: false,
+                        is_local_discovered: true,
                         socket
                     }))
                 }
@@ -581,16 +587,15 @@ impl UdpConnectionEstablisher {
                             if let Ok(pubkey) = PublicKey::try_from(pubkey_bytes) {
                                 // send response
 
-                                info!("Recv packet to multicast discovery socket! sending response...");
-                                let mut resp = vec![];
-                                resp.extend_from_slice(RESP_SIGNATURE);
-                                resp.extend_from_slice(self.key.verifying_key().as_bytes());
-                                if let Err(e) = local_discovery.socket.send_to(&resp, addr).await {
-                                    warn!("Failed to send local discovery confirmation: {:?}", e);
-                                }
-
+                                info!("Received multicast discovery connection from {}, trying to connect...", addr);
                                 if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) {
-                                    info!("Received multicast discovery connection from {}, trying to connect...", addr);
+                                    let mut resp = vec![];
+                                    resp.extend_from_slice(RESP_SIGNATURE);
+                                    resp.extend_from_slice(self.key.verifying_key().as_bytes());
+                                    if let Err(e) = local_discovery.socket.send_to(&resp, addr).await {
+                                        warn!("Failed to send local discovery confirmation: {:?}", e);
+                                    }
+
 
                                     let socket = mem::replace(&mut local_discovery.socket, new_udp_socket(self.p2p_interface_tracker.current_interface()).await);
                                     *local_discovery.multicast_discovery_socket.local_service_port().unwrap() = local_discovery.socket.local_addr().unwrap().port();
@@ -599,6 +604,7 @@ impl UdpConnectionEstablisher {
                                         pubkey,
                                         remote_addr: addr,
                                         is_listener: true,
+                                        is_local_discovered: true,
                                         socket,
                                     }))
                                 }
@@ -701,11 +707,13 @@ impl UdpConnectionEstablisher {
                                 // mark connection as connected (or connection in progress)
                                 state.on_connection_established();
                                 self.last_request_tm = None; // retry immediately on next poll
+
                                 Some(Ok(NewP2pConnection {
                                     pubkey: peer_pubkey,
                                     remote_addr: actual_peer_addr,
                                     socket,
                                     is_listener,
+                                    is_local_discovered: false,
                                 }))
                             }
                             else {
@@ -801,6 +809,7 @@ pub struct QuicP2pConnection {
     pub quic_connection: quinn::Connection,
     pub remote_pubkey: PublicKey,
     pub remote_addr: SocketAddr,
+    pub is_local_discovered: bool,
 }
 
 /// Wraps `UdpConnectionEstablisher` and additionally establishes a QUIC connection
@@ -876,6 +885,7 @@ impl UdpQuicConnectionEstablisher {
                     quic_connection,
                     remote_pubkey,
                     remote_addr,
+                    is_local_discovered: conn.is_local_discovered,
                 }))
             }
             Err(e) => {

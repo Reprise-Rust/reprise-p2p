@@ -80,7 +80,13 @@ async fn main() {
                 // just timeout or invalid connection request
             }
             Some(Ok(conn)) => {
-                info!("Hole-punched connection established with: {}", conn.remote_addr);
+                let kind = if conn.is_local_discovered {
+                    "Local discovered"
+                }
+                else {
+                    "Hole-punched"
+                };
+                info!("{} UDP connection established with: {}", kind, conn.remote_addr);
                 run_chat_session(conn, &mut stdin_rx).await;
                 println!("Disconnected. Waiting for new connection...");
                 // Re-add to re-enable connection requests with this remote
