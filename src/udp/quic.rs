@@ -1,7 +1,7 @@
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
-use anyhow::Context;
+use anyhow::{anyhow, Context, bail};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use quinn::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -12,6 +12,7 @@ use quinn::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use quinn::{rustls, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime, TransportConfig};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rcgen::{CertificateParams, PKCS_ED25519};
+use tokio::time::timeout;
 use crate::udp::messages::PublicKey;
 
 pub fn quinn_cert_from_key(signing_key: &SigningKey) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
@@ -25,7 +26,7 @@ pub fn quinn_cert_from_key(signing_key: &SigningKey) -> anyhow::Result<(Certific
     Ok((cert.der().clone(), priv_key_der.clone_key()))
 }
 
-pub async fn make_quin_endpoint(endpoint_config: EndpointConfig, transport_config: Arc<TransportConfig>, signing_key: &SigningKey, socket: std::net::UdpSocket, expected_pubkey: PublicKey) -> anyhow::Result<Endpoint> {
+pub fn make_quin_endpoint(endpoint_config: EndpointConfig, transport_config: Arc<TransportConfig>, signing_key: &SigningKey, socket: std::net::UdpSocket, expected_pubkey: PublicKey) -> anyhow::Result<Endpoint> {
     let (cert, key) = quinn_cert_from_key(&signing_key)?;
 
     let expected_pubkey = VerifyingKey::from_bytes(&expected_pubkey)?;
@@ -43,14 +44,24 @@ pub async fn make_quin_endpoint(endpoint_config: EndpointConfig, transport_confi
     Ok(ep)
 }
 
-pub async fn establish_server_quic_connection(ep: Endpoint) -> anyhow::Result<Connection> {
-    let incoming = ep.accept().await.context("Failed to accept QUIC connection")?;
-    let con = incoming.await?;
+pub async fn establish_server_quic_connection(ep: Endpoint, timeout_ms: u64) -> anyhow::Result<Connection> {
+    let incoming = match timeout(Duration::from_millis(timeout_ms), ep.accept()).await {
+        Ok(Some(res)) => res,
+        Ok(None) => bail!("QUIC accept returned None!"),
+        Err(_) => bail!("Timeout waiting for quic connection")
+    };
+    let con = match timeout(Duration::from_millis(timeout_ms), incoming).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(err)) => Err(err)?,
+        Err(_) => bail!("Timeout waiting for quic connection")
+    };
+
     Ok(con)
 }
 
 pub async fn establish_client_quic_connection(
     mut ep: Endpoint,
+    timeout_ms: u64,
     transport_config: Arc<TransportConfig>,
     signing_key: &SigningKey,
     remote_addr: SocketAddr,
@@ -73,7 +84,12 @@ pub async fn establish_client_quic_connection(
     ep.set_default_client_config(client_config);
 
     let connecting = ep.connect(remote_addr, "reprise-p2p")?;
-    let con = connecting.await?;
+    let con = match timeout(Duration::from_millis(timeout_ms), connecting).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(err)) => Err(err)?,
+        Err(_) => bail!("Timeout waiting for quic connection")
+    };
+
     Ok(con)
 }
 

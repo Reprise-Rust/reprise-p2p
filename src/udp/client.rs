@@ -15,7 +15,7 @@ use multicast_discovery_socket::config::MulticastDiscoveryConfig;
 use multicast_discovery_socket::{MulticastDiscoverySocket, PollResult};
 use quinn::{rustls, EndpointConfig, TransportConfig};
 use rand::seq::SliceRandom;
-use rand::random;
+use rand::{random, random_range};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -525,6 +525,10 @@ impl UdpConnectionEstablisher {
                 const RESP_SIGNATURE: &'static [u8] = b"multicast-discovery-p2p";
                 if let Some((addr, pubkey)) = res {
                     info!("Discovered client {} via local discovery, trying to connect...", addr);
+                    
+                    let rand_wait_time = random_range(0..50);
+                    tokio::time::sleep(Duration::from_millis(rand_wait_time)).await;
+                    
                     let mut buf = Vec::new();
                     buf.extend_from_slice(b"multicast-discovery-p2p");
                     buf.extend_from_slice(&self.key.verifying_key().to_bytes());
@@ -586,7 +590,6 @@ impl UdpConnectionEstablisher {
                             let pubkey_bytes = &msg[pattern.len()..];
                             if let Ok(pubkey) = PublicKey::try_from(pubkey_bytes) {
                                 // send response
-
                                 info!("Received multicast discovery connection from {}, trying to connect...", addr);
                                 if is_local_discovery_enabled_for(&self.last_p2p_server_pong, &self.trusted_remotes, &pubkey) {
                                     let mut resp = vec![];
@@ -865,7 +868,7 @@ impl UdpQuicConnectionEstablisher {
         let remote_pubkey = conn.pubkey;
         let is_listener = conn.is_listener;
 
-        let ep = match quic::make_quin_endpoint(self.endpoint_config.clone(), self.transport_config.clone(), &self.signing_key, conn.socket.into_std().unwrap(), remote_pubkey).await {
+        let ep = match quic::make_quin_endpoint(self.endpoint_config.clone(), self.transport_config.clone(), &self.signing_key, conn.socket.into_std().unwrap(), remote_pubkey) {
             Ok(ep) => ep,
             Err(e) => {
                 self.inner.on_connection_closed(remote_pubkey);
@@ -873,10 +876,11 @@ impl UdpQuicConnectionEstablisher {
             }
         };
 
+        let timeout = 500;
         let res = if is_listener {
-            quic::establish_server_quic_connection(ep).await.context("Establishing client quic connection")
+            quic::establish_server_quic_connection(ep, timeout).await.context("Establishing client quic connection")
         } else {
-            quic::establish_client_quic_connection(ep, self.transport_config.clone(), &self.signing_key, remote_addr, remote_pubkey).await.context("Establishing server quic connection")
+            quic::establish_client_quic_connection(ep, timeout, self.transport_config.clone(), &self.signing_key, remote_addr, remote_pubkey).await.context("Establishing server quic connection")
         };
         match res {
             Ok(quic_connection) => {
