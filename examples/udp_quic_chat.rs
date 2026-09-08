@@ -1,3 +1,4 @@
+use std::env;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -8,11 +9,22 @@ use log::{error, info, Level};
 use quinn::{EndpointConfig, TransportConfig};
 use rand::rngs;
 use rand::rand_core::UnwrapErr;
-use reprise_p2p::udp::client::UdpQuicConnectionEstablisher;
+use reprise_p2p::udp::client::{LocalDiscoveryConfig, UdpQuicConnectionEstablisher};
 
 #[tokio::main]
 async fn main() {
     simple_logger::init_with_level(Level::Info).unwrap();
+
+    let local_discovery_config = if env::args().nth(1).is_some_and(|a| a == "--local-disc") {
+        info!("Starting with local multicast discovery...");
+        Some(LocalDiscoveryConfig{
+            service_name: "reprise-p2p:chat-example".into(),
+            multicast_group_addr: Ipv4Addr::new(229, 12,82, 12),
+            obfuscation_key: "udp-chat-key".into(),
+        })
+    } else {
+        None
+    };
 
     let server_addr = SocketAddrV4::new(Ipv4Addr::new(155, 212, 168, 136), 47002);
 
@@ -44,7 +56,7 @@ async fn main() {
     };
 
     let peer_key: [u8; 32] = peer_key.try_into().unwrap();
-    let mut client = UdpQuicConnectionEstablisher::new(signing_key.clone(), server_addr, None, EndpointConfig::default(), Arc::new(TransportConfig::default())).await;
+    let mut client = UdpQuicConnectionEstablisher::new(signing_key.clone(), server_addr, local_discovery_config, EndpointConfig::default(), Arc::new(TransportConfig::default())).await;
     client.add_trusted_remote(peer_key);
     println!("Initialized, waiting for connection...");
 
@@ -100,7 +112,8 @@ async fn run_chat_session(
                     }
                     Some(msg) => {
                         let bytes = msg.into_bytes().into();
-                        if con.send_datagram_wait(bytes).await.is_err() {
+                        if let Err(e) = con.send_datagram_wait(bytes).await {
+                            error!("send error: {:?}", e);
                             break;
                         }
                     }
@@ -116,8 +129,8 @@ async fn run_chat_session(
                         let msg = String::from_utf8_lossy(&buf);
                         println!("<peer> {}", msg);
                     }
-                    Err(_) => {
-                        println!("Connection lost.");
+                    Err(e) => {
+                        println!("Connection error: {:?}", e);
                         break;
                     }
                 }

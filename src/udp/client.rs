@@ -29,6 +29,7 @@ const HOLE_PUNCH_FAILED_INITIAL_TIMEOUT_MS: u64 = 100;
 const HOLE_PUNCH_FAILED_MAX_TIMEOUT_MS: u64 = 5_000;
 const LOCAL_DISCOVERY_DURATION_SECS: u64 = 6;
 const LOCAL_DISCOVERY_ENABLE_DELAY_SECS: u64 = 3;
+const SERVER_OFFLINE_DETECTION_SECS: u64 = 10;
 
 enum PeerStateKind {
     ConnectionActive,
@@ -137,6 +138,7 @@ pub struct UdpConnectionEstablisher {
     last_p2p_server_ping_send_tm: Option<Instant>,
     last_p2p_server_ping: Option<(Instant, u64)>,
     last_p2p_server_pong: Option<Instant>,
+    server_online: bool,
     /// Keep first 5 seconds of polling with local discovery disabled
     poll_start_tm: Option<Instant>,
 
@@ -257,6 +259,7 @@ impl UdpConnectionEstablisher {
             cur_interface: p2p_interface_tracker.current_interface().map(|i| i.name),
             p2p_interface_tracker,
             local_discovery,
+            server_online: false,
             last_p2p_server_ping_send_tm: None,
             last_p2p_server_ping: None,
             last_p2p_server_pong: None,
@@ -303,6 +306,17 @@ impl UdpConnectionEstablisher {
         self.trusted_remotes.entry(key).or_default().resume_discovery();
         // reset last request tm to send new trusted remotes list as soon as possible
         self.last_request_tm = None;
+    }
+
+    pub fn is_server_online(&mut self) -> bool {
+        if self.last_p2p_server_pong.is_some_and(|p| p.elapsed() > Duration::from_secs(SERVER_OFFLINE_DETECTION_SECS)) {
+            if self.server_online {
+                info!("P2P discovery server is now offline!");
+            }
+            self.server_online = false;
+        }
+
+        self.server_online
     }
 
     /// Take up to 50 trusted remotes. If there are more than 50, pick exactly 50 at random.
@@ -441,6 +455,8 @@ impl UdpConnectionEstablisher {
         if self.poll_start_tm.is_none() {
             self.poll_start_tm = Some(Instant::now());
         }
+        // poll server offline state switch
+        self.is_server_online();
 
         let cur_interface = self.p2p_interface_tracker.current_interface().clone();
         let cur_interface_name = cur_interface.as_ref().map(|i| i.name.clone());
@@ -458,7 +474,7 @@ impl UdpConnectionEstablisher {
                 // 1) multicast discovery
                 // 1.1) announcement enable decision and polling
                 let announcement_enabled = self.poll_start_tm.is_some_and(|tm| tm.elapsed().as_secs() > LOCAL_DISCOVERY_ENABLE_DELAY_SECS) &&
-                    (self.last_p2p_server_pong.is_none_or(|tm| tm.elapsed().as_secs() > 10) || self.trusted_remotes.iter().any(|(_, s)| s.is_local_discovery_enabled()));
+                    (self.last_p2p_server_pong.is_none_or(|tm| tm.elapsed().as_secs() > SERVER_OFFLINE_DETECTION_SECS) || self.trusted_remotes.iter().any(|(_, s)| s.is_local_discovery_enabled()));
 
                 local_discovery.multicast_discovery_socket.set_announce_en(announcement_enabled);
                 local_discovery.multicast_discovery_socket.set_discover_replies_en(announcement_enabled);
@@ -722,6 +738,10 @@ impl UdpConnectionEstablisher {
                                 last_payload == payload && tm.elapsed().as_secs() < 10
                             }) {
                                 self.last_p2p_server_pong = Some(Instant::now());
+                                if !self.server_online {
+                                    info!("P2P discovery server is now online!");
+                                }
+                                self.server_online = true;
                             }
 
                             None

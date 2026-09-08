@@ -126,9 +126,6 @@ async fn run_chat_session(
             }
             recv = socket.recv(&mut buf) => {
                 match recv {
-                    Ok(0) => {
-                        println!("Connection closed!")
-                    }
                     Ok(sz) => {
                         let msg = String::from_utf8_lossy(&buf[..sz]);
                         println!("<peer> {}", msg);
